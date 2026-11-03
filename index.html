@@ -2952,7 +2952,10 @@
         taxRatePercent: 0,
         taxInclusive: true,
         receiptFooter: 'Thank you for your purchase!',
-        startingCashFloat: 0
+        startingCashFloat: 0,
+        invoiceNumberStart: '1',
+        invoiceNumberNext: '1',
+        categoryMappings: {}
       },
       activitySearchQuery: '',
       activitySelectedDate: '',
@@ -3053,6 +3056,23 @@
       formatMoney(value) {
         const sym = String(this.posConfig?.currencySymbol || '₱');
         return `${sym}${Number(value || 0).toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+      },
+      incrementInvoiceNumber(value) {
+        const current = String(value ?? '').trim();
+        const match = current.match(/^(.*?)(\d+)$/);
+        if (!match) return `${current}-1`;
+        const digits = match[2];
+        const next = String(Number(digits) + 1).padStart(digits.length, '0');
+        return `${match[1]}${next}`;
+      },
+      saveInvoiceNumberingFromForm(event) {
+        event?.preventDefault?.();
+        const start = String(document.getElementById('cfg-invoice-start')?.value ?? '').trim();
+        if (!start) { this.showToast('Enter a starting sales invoice number.', 'error'); return; }
+        const duplicate = (this.sales || []).some(sale => String(sale.invoiceNumber || '') === start);
+        if (duplicate) { this.showToast(`Invoice number ${start} has already been used. Choose an unused starting number.`, 'error'); return; }
+        this.savePosConfig({ invoiceNumberStart: start, invoiceNumberNext: start });
+        this.showToast(`Sales invoice numbering will start at ${start}.`, 'success');
       },
       getCurrentActor() {
         try { return window.UISAuth?.getCurrentUser?.() || 'Local Operator'; }
@@ -3329,29 +3349,86 @@
         if (this.workbook) this.captureActiveWorkbookSession();
       },
 
-      openWorkspaceDatabase() {
+      async openWorkspaceDatabase() {
         if (this._workspaceDbPromise) return this._workspaceDbPromise;
-        this._workspaceDbPromise = new Promise((resolve, reject) => {
-          if (!('indexedDB' in window)) { reject(new Error('IndexedDB is unavailable')); return; }
-          const request = indexedDB.open('UIS_LocalWorkspace', 7);
-          request.onupgradeneeded = () => {
-            const db = request.result;
-            if (!db.objectStoreNames.contains('snapshots')) db.createObjectStore('snapshots', { keyPath: 'id' });
-            if (!db.objectStoreNames.contains('searchIndexes')) db.createObjectStore('searchIndexes', { keyPath: 'id' });
-            if (!db.objectStoreNames.contains('operators')) db.createObjectStore('operators', { keyPath: 'username' });
-            if (!db.objectStoreNames.contains('salesReports')) db.createObjectStore('salesReports', { keyPath: 'id' });
+        this._workspaceDbPromise = (async () => {
+          if (!('indexedDB' in window)) throw new Error('IndexedDB is unavailable in this browser or browsing mode.');
+
+          const dbName = 'UIS_LocalWorkspace';
+          const requiredStores = {
+            snapshots: { keyPath: 'id' },
+            searchIndexes: { keyPath: 'id' },
+            operators: { keyPath: 'username' },
+            salesReports: { keyPath: 'id' }
           };
-          request.onsuccess = () => {
-            const db = request.result;
-            db.onversionchange = () => { try { db.close(); } catch (_) {} this._workspaceDbPromise = null; };
-            resolve(db);
+          const missingStores = db => Object.keys(requiredStores).filter(name => !db.objectStoreNames.contains(name));
+          const addMissingStores = db => {
+            for (const name of missingStores(db)) {
+              if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, requiredStores[name]);
+            }
           };
-          request.onerror = () => { this._workspaceDbPromise = null; reject(request.error || new Error('Could not open local recovery storage')); };
-          request.onblocked = () => { this._workspaceDbPromise = null; reject(new Error('Database upgrade is waiting for another app tab. Close every open POS tab/window, then tap Retry. Your saved data is not being erased.')); };
+          const openRequest = (version) => new Promise((resolve, reject) => {
+            let request;
+            try {
+              // Omitting the version opens the latest existing version; it never downgrades it.
+              request = version == null ? indexedDB.open(dbName) : indexedDB.open(dbName, version);
+            } catch (error) { reject(error); return; }
+            request.onupgradeneeded = event => {
+              // Only create stores that are absent. Existing stores and records are untouched.
+              addMissingStores(request.result);
+            };
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error || new Error('Unknown IndexedDB open error.'));
+            request.onblocked = () => reject(new Error('The local database upgrade is blocked by another open POS tab. Close other POS tabs and retry. No data was deleted.'));
+          });
+
+          // Ask browsers that support databases() for metadata. The actual open below
+          // remains the compatibility fallback and works where databases() is unavailable.
+          let discovered = null;
+          try {
+            if (typeof indexedDB.databases === 'function') {
+              const list = await indexedDB.databases();
+              discovered = list.find(item => item && item.name === dbName) || null;
+            }
+          } catch (_) { /* Metadata enumeration is optional and permission-dependent. */ }
+
+          let db = await openRequest(null);
+          let missing = missingStores(db);
+          if (missing.length) {
+            const nextVersion = db.version + 1;
+            try { db.close(); } catch (_) {}
+            // A version bump is needed only to add missing stores. Never use a fixed
+            // version number, and never delete/recreate a database to repair a schema.
+            db = await openRequest(nextVersion);
+            missing = missingStores(db);
+          }
+          if (missing.length) {
+            try { db.close(); } catch (_) {}
+            throw new Error(`The local database is missing required stores (${missing.join(', ')}) and the browser could not add them safely.`);
+          }
+
+          this._workspaceDbInfo = {
+            name: db.name,
+            version: db.version,
+            discoveredVersion: discovered?.version ?? null,
+            stores: Array.from(db.objectStoreNames)
+          };
+          db.onversionchange = () => {
+            try { db.close(); } catch (_) {}
+            this._workspaceDbPromise = null;
+          };
+          db.onclose = () => { this._workspaceDbPromise = null; };
+          return db;
+        })().catch(error => {
+          this._workspaceDbPromise = null;
+          const detail = error?.message || String(error || 'Unknown browser storage error');
+          const isBackingStoreError = /backing store|unknownerror|internal error/i.test(detail) || error?.name === 'UnknownError';
+          throw new Error(isBackingStoreError
+            ? 'The browser reported an internal IndexedDB backing-store error while opening the existing POS database. The POS did not delete, reset, or overwrite your accounts or records. Automatic version detection cannot repair browser-level storage corruption. Close all POS tabs, fully restart the browser, then retry the same site in the original browser profile. Do not clear site data or reset storage.'
+            : `Could not open local POS storage (${error?.name || 'Error'}): ${detail}. Existing records were not intentionally changed.`);
         });
         return this._workspaceDbPromise;
       },
-
       async flushWorkspaceSave() {
         clearTimeout(this._workspaceSaveTimer);
         this._workspaceSaveTimer = null;
@@ -3520,7 +3597,7 @@
           this.sales = Array.isArray(snapshot.sales) ? snapshot.sales : [];
           this.posLastReceipt = snapshot.posLastReceipt || null;
           this.posCart = Array.isArray(snapshot.posCart) ? snapshot.posCart.filter(line => line && typeof line.key === 'string' && Number.isSafeInteger(Number(line.quantity)) && Number(line.quantity) > 0 && Number.isFinite(Number(line.unitPrice)) && Number(line.unitPrice) >= 0).map(line => ({ key: line.key, quantity: Number(line.quantity), unitPrice: Number(line.unitPrice) })) : [];
-          this.posPaymentMethod = ['Cash','Card','GCash','Maya','Other'].includes(snapshot.posPaymentMethod) ? snapshot.posPaymentMethod : 'Cash';
+          this.posPaymentMethod = ['Cash','QRPH','BDO PAY','ALI PAY','WE CHAT','CHECK',"BOSS IVAN'S CONSIGNMENT",'ONLINE CREDIT CARD','CREDIT CARD','DEBIT CARD'].includes(snapshot.posPaymentMethod) ? snapshot.posPaymentMethod : 'Cash';
           this.posPaymentReference = String(snapshot.posPaymentReference || '');
           this.posCashReceived = String(snapshot.posCashReceived || '');
           this.posCustomerNote = String(snapshot.posCustomerNote || '');
@@ -4211,7 +4288,7 @@
         this.renderPosView(document.getElementById('main-view-container'));
       },
       setPosPayment(method) {
-        if (!['Cash','Card','GCash','Maya','Other'].includes(method)) return;
+        if (!['Cash','QRPH','BDO PAY','ALI PAY','WE CHAT','CHECK',"BOSS IVAN'S CONSIGNMENT",'ONLINE CREDIT CARD','CREDIT CARD','DEBIT CARD'].includes(method)) return;
         this.posPaymentMethod = method;
         this.scheduleWorkspaceSave();
         this.renderPosView(document.getElementById('main-view-container'));
@@ -4225,6 +4302,117 @@
         if (value !== undefined) this.posDiscountValue = String(value ?? '');
         this.scheduleWorkspaceSave();
         this.renderPosView(document.getElementById('main-view-container'));
+      },
+      getPosCategoryOptions() {
+        // These are the sales buckets in the uploaded DSR / CSR 2026 template.
+        return ['Singles','GNR','GNS','Local','Hot Toys','Cosbaby','Cosbi(CBX)','Funko','Loungefly','Rokimoto','Urdu','Flotaku','Pop Mart','52 Toys','Muse/Nullset','Pyramid','Toys','Banpresto','Blokees','Funism','Ohku','Top Toys','Kayou','Card Fun','KPOP','Others'];
+      },
+      getPosCategoryForSource(workbookName, sheetName, fallback = '') {
+        const mappings = this.posConfig?.categoryMappings || {};
+        const sheetKey = `${String(workbookName || '')}::${String(sheetName || '')}`;
+        const workbookKey = `${String(workbookName || '')}::*`;
+        const options = this.getPosCategoryOptions();
+        // A worksheet-specific mapping overrides the whole-workbook mapping.
+        const configured = String(mappings[sheetKey] || mappings[workbookKey] || '').trim();
+        if (configured && options.includes(configured)) return configured;
+        const savedFallback = String(fallback || '').trim();
+        return options.includes(savedFallback) ? savedFallback : 'Others';
+      },
+      getPosInventoryDescription(item) {
+        if (!item) return '';
+        const workbooks = this.getWorkspaceWorkbooks() || [];
+        const sourceWorkbook = workbooks[Number(item.workbookIdx) || 0] || workbooks.find(wb => String(wb.filename || '') === String(item.workbookName || ''));
+        const sheet = item.sheet || sourceWorkbook?.worksheets?.find(ws => String(ws.sheetName) === String(item.sheetName));
+        const record = item.record || sheet?.records?.find(rec => Number(rec.rowNumber) === Number(item.rowNumber));
+        if (!sheet || !record) return String(item.itemName || '').trim();
+        const headers = Array.isArray(sheet.headers) ? sheet.headers : [];
+        const excludedHeader = /barcode|upc|ean|sku|item\s*code|product\s*code|price|cost|qty|quantity|stock|category|date|image|photo|url|link|supplier|vendor|status|row\s*id/i;
+        const columns = new Set();
+        (sheet.records || []).forEach(rec => Object.keys(rec.cells || {}).forEach(key => {
+          const index = Number(key);
+          if (Number.isInteger(index) && index >= 0) columns.add(index);
+        }));
+        let bestCol = -1, bestScore = -1;
+        columns.forEach(col => {
+          const header = String(headers.find(h => Number(h.colIndex) === col)?.name || headers.find(h => Number(h.colIndex) === col)?.label || '').trim();
+          if (header && excludedHeader.test(header)) return;
+          let words = 0, letters = 0, textRows = 0;
+          (sheet.records || []).forEach(rec => {
+            const raw = rec.cells?.[col]?.value;
+            if (raw === undefined || raw === null) return;
+            const value = String(raw).replace(/\s+/g, ' ').trim();
+            if (!value || !/[A-Za-z]/.test(value)) return;
+            const wordCount = (value.match(/[A-Za-z0-9]+(?:['’/-][A-Za-z0-9]+)*/g) || []).length;
+            const letterCount = (value.match(/[A-Za-z]/g) || []).length;
+            if (wordCount < 1 || letterCount < 3) return;
+            words += wordCount; letters += letterCount; textRows++;
+          });
+          // The description field is the text-heavy column across the worksheet grid.
+          const score = words * 100 + letters + textRows * 2;
+          if (score > bestScore) { bestScore = score; bestCol = col; }
+        });
+        const detected = bestCol >= 0 ? String(record.cells?.[bestCol]?.value ?? '').replace(/\s+/g, ' ').trim() : '';
+        return detected || String(item.itemName || '').trim();
+      },
+      getPosCategoryForItem(item) {
+        if (!item) return 'Others';
+        const mappingKey = `${String(item.workbookName || '')}::${String(item.sheetName || '')}`;
+        const workbookKey = `${String(item.workbookName || '')}::*`;
+        const configured = String(this.posConfig?.categoryMappings?.[mappingKey] || this.posConfig?.categoryMappings?.[workbookKey] || '').trim();
+        if (configured && this.getPosCategoryOptions().includes(configured)) return configured;
+        // Prefer a real Category / Product Category column in the inventory row when no mapping is set.
+        try {
+          const headers = Array.isArray(item.sheet?.headers) ? item.sheet.headers : [];
+          const categoryHeader = headers.find(header => /^(product\s*)?category(\s*name)?$/i.test(String(header.name || header.label || '').trim()));
+          if (categoryHeader) {
+            const raw = String(item.record?.cells?.[categoryHeader.colIndex]?.value || '').trim();
+            if (raw) {
+              const match = this.getPosCategoryOptions().find(option => option.toLowerCase() === raw.toLowerCase());
+              if (match) return match;
+            }
+          }
+        } catch (_) {}
+        // Safe automatic match when the inventory worksheet itself is named for a DSR bucket.
+        const normalized = String(item.sheetName || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        const aliases = { hottoys:'hottoys', cosbaby:'cosbaby', cosbicbx:'cosbicbx', '52toys':'52toys', muse:'muse nullset' };
+        const alias = aliases[normalized];
+        const candidates = this.getPosCategoryOptions();
+        const exact = candidates.find(option => option.toLowerCase().replace(/[^a-z0-9]/g, '') === normalized);
+        if (exact) return exact;
+        if (alias) {
+          const found = candidates.find(option => option.toLowerCase().replace(/[^a-z0-9]/g, '') === alias.replace(/[^a-z0-9]/g, ''));
+          if (found) return found;
+        }
+        return 'Others';
+      },
+      setPosCategoryMapping(mappingKey, category) {
+        const mappings = { ...(this.posConfig?.categoryMappings || {}) };
+        if (!category) delete mappings[mappingKey];
+        else if (this.getPosCategoryOptions().includes(category)) mappings[mappingKey] = category;
+        this.savePosConfig({ categoryMappings: mappings });
+        this.showToast('Inventory category mapping saved.', 'success');
+      },
+      getPosCategorySalesSummary(dateKey = '') {
+        const totals = new Map();
+        (Array.isArray(this.sales) ? this.sales : []).forEach(sale => {
+          if (!sale || sale.voided) return;
+          const stamp = new Date(sale.timestamp);
+          if (!Number.isFinite(stamp.getTime())) return;
+          const saleDate = `${stamp.getFullYear()}-${String(stamp.getMonth()+1).padStart(2,'0')}-${String(stamp.getDate()).padStart(2,'0')}`;
+          if (dateKey && saleDate !== dateKey) return;
+          const lines = Array.isArray(sale.lines) ? sale.lines : [];
+          const subtotal = lines.reduce((sum, line) => sum + (Number(line.lineTotal) || (Number(line.quantity)||0)*(Number(line.unitPrice)||0)), 0);
+          if (!subtotal) return;
+          lines.forEach(line => {
+            const category = this.getPosCategoryForSource(line.workbookName, line.sheetName, line.category);
+            const lineSubtotal = Number(line.lineTotal) || (Number(line.quantity)||0)*(Number(line.unitPrice)||0);
+            const declaredNetSales = Number(sale.subtotal) - Number(sale.discount || 0);
+            const categorySalesBase = Number.isFinite(declaredNetSales) && declaredNetSales >= 0 ? declaredNetSales : (Number(sale.total) || subtotal);
+            const allocated = lineSubtotal * (categorySalesBase / subtotal);
+            totals.set(category, (totals.get(category) || 0) + allocated);
+          });
+        });
+        return [...totals.entries()].map(([category, amount]) => ({ category, amount: Math.round((amount + Number.EPSILON)*100)/100 })).sort((a,b)=>a.category.localeCompare(b.category));
       },
       getPosCartDetails() {
         return (this.posCart || []).map(line => {
@@ -4275,6 +4463,10 @@
             this.showToast(`Resolve the quantity column for ${line.item.workbookName} → ${line.item.sheetName} before selling this item.`, 'error'); return;
           }
         }
+        const invoiceNumber = String(this.posConfig?.invoiceNumberNext || this.posConfig?.invoiceNumberStart || '1').trim() || '1';
+        if ((this.sales || []).some(sale => String(sale.invoiceNumber || '') === invoiceNumber)) {
+          this.showToast(`Sales invoice number ${invoiceNumber} has already been used. Change the starting number in POS Settings.`, 'error'); return;
+        }
         const saleId = `POS-${new Date().toISOString().replace(/[-:TZ.]/g,'').slice(0,14)}-${String(Date.now()).slice(-4)}`;
         const now = new Date().toISOString(), receiptLines = [];
         try {
@@ -4305,12 +4497,12 @@
               reference: saleId, details: `${line.quantity} unit(s) · ${method} · ${this.formatMoney(line.lineTotal)}`
             }, { category: 'sales' });
             receiptLines.push({
-              workbookIdx, workbookName: item.workbookName, itemName: item.itemName, barcode: item.codes.join(' | '),
-              sheetName: item.sheetName, rowNumber: item.rowNumber, quantity: line.quantity, unitPrice: line.unitPrice, lineTotal: line.lineTotal
+              workbookIdx, workbookName: item.workbookName, itemName: item.itemName, description: this.getPosInventoryDescription(item), barcode: item.codes.join(' | '),
+              sheetName: item.sheetName, rowNumber: item.rowNumber, category: this.getPosCategoryForItem(item), quantity: line.quantity, unitPrice: line.unitPrice, lineTotal: line.lineTotal
             });
           });
           const sale = {
-            id: saleId, timestamp: now, actor: this.getCurrentActor(), paymentMethod: method,
+            id: saleId, invoiceNumber, timestamp: now, actor: this.getCurrentActor(), paymentMethod: method,
             paymentReference: String(this.posPaymentReference || '').trim(),
             customerNote: String(this.posCustomerNote || '').trim(),
             subtotal: totals.subtotal, discount: totals.discount, taxRate: totals.taxRate,
@@ -4321,6 +4513,8 @@
             lines: receiptLines
           };
           this.sales.unshift(sale);
+          this.posConfig = { ...this.posConfig, invoiceNumberNext: this.incrementInvoiceNumber(invoiceNumber) };
+          try { localStorage.setItem('uis-pos-config-v1', JSON.stringify(this.posConfig)); } catch (_) {}
           if (this.sales.length > 50000) this.sales.length = 50000;
           this.posLastReceipt = sale;
           this.posCart = [];
@@ -4375,13 +4569,13 @@
       exportPosSales() {
         const rows = [];
         (this.sales || []).forEach(sale => (sale.lines || []).forEach(line => rows.push([
-          sale.id, sale.timestamp, sale.actor || 'Unknown', sale.voided ? 'VOIDED' : 'COMPLETED', sale.paymentMethod, sale.paymentReference || '',
-          line.itemName, line.barcode, line.workbookName || '', line.sheetName, line.rowNumber,
+          sale.invoiceNumber || '', sale.id, sale.timestamp, sale.actor || 'Unknown', sale.voided ? 'VOIDED' : 'COMPLETED', sale.paymentMethod, sale.paymentReference || '',
+          line.itemName, line.category || 'Others', line.barcode, line.workbookName || '', line.sheetName, line.rowNumber,
           line.quantity, line.unitPrice, line.lineTotal, sale.subtotal ?? sale.total, sale.discount ?? 0, sale.taxAmount ?? 0, sale.total,
           sale.paymentMethod === 'Cash' ? sale.cashReceived : '', sale.paymentMethod === 'Cash' ? sale.change : '', sale.customerNote || ''
         ])));
         if (!rows.length) { this.showToast('There are no completed sales to export yet.', 'error'); return; }
-        this.downloadCsv('UIS_POS_Sales.csv', ['Sale ID','Date / Time','Cashier','Status','Payment Method','Payment Ref','Item','Barcode / SKU','Workbook','Worksheet','Row','Quantity','Unit Price','Line Total','Subtotal','Discount','Tax','Sale Total','Cash Received','Change','Note'], rows);
+        this.downloadCsv('UIS_POS_Sales.csv', ['Sales Invoice No.','POS Transaction ID','Date / Time','Cashier','Status','Payment Method','Payment Ref','Item','Category','Barcode / SKU','Workbook','Worksheet','Row','Quantity','Unit Price','Line Total','Subtotal','Discount','Tax','Sale Total','Cash Received','Change','Note'], rows);
         this.recordActivity('POS_SALES_EXPORTED', { details: `Exported ${rows.length} POS sale line(s) to CSV.` }, { category:'sales', affectsWorkbook:false });
         this.showToast('Workspace-wide POS sales report exported.');
       },
@@ -4392,9 +4586,9 @@
         const safe = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
         const rows = (sale.lines || []).map(line => `<tr><td>${safe(line.itemName)}<div class="muted">${safe(line.barcode || '')}</div></td><td>${line.quantity}</td><td>${sym}${Number(line.unitPrice).toFixed(2)}</td><td>${sym}${Number(line.lineTotal).toFixed(2)}</td></tr>`).join('');
         this.openPrintWindow(
-          `Receipt ${sale.id}`,
+          `Sales Invoice ${sale.invoiceNumber || sale.id}`,
           "@page{size:80mm auto;margin:4mm}body{font:12px 'Courier New',monospace;max-width:300px;margin:0 auto;color:#000}h1{text-align:center;font-size:16px;margin:0 0 4px}table{width:100%;border-collapse:collapse;margin:10px 0}td,th{padding:4px 2px;border-bottom:1px dashed #999;text-align:left;vertical-align:top}td:last-child,th:last-child{text-align:right}.total{text-align:right;font-size:15px;font-weight:bold;margin-top:6px}.muted{color:#444;font-size:10px}.center{text-align:center}",
-          `<h1>${safe(this.posConfig.storeName || 'SALES RECEIPT')}</h1>${this.posConfig.storeAddress?`<div class="center muted">${safe(this.posConfig.storeAddress)}</div>`:''}${this.posConfig.storeTin?`<div class="center muted">TIN: ${safe(this.posConfig.storeTin)}</div>`:''}<hr><div class="muted">Receipt: ${safe(sale.id)}${sale.voided?' (VOIDED)':''}<br>Date: ${safe(new Date(sale.timestamp).toLocaleString())}<br>Cashier: ${safe(sale.actor || 'Operator')}${sale.customerNote?`<br>Note: ${safe(sale.customerNote)}`:''}</div><table><thead><tr><th>Item</th><th>Qty</th><th>Price</th><th>Total</th></tr></thead><tbody>${rows}</tbody></table><div style="text-align:right">Subtotal: ${sym}${Number(sale.subtotal ?? sale.total).toFixed(2)}${Number(sale.discount)>0?`<br>Discount: −${sym}${Number(sale.discount).toFixed(2)}`:''}${Number(sale.taxAmount)>0?`<br>Tax (${Number(sale.taxRate||0)}% ${sale.taxInclusive?'Incl.':'Excl.'}): ${sym}${Number(sale.taxAmount).toFixed(2)}`:''}</div><div class="total">TOTAL: ${sym}${Number(sale.total).toFixed(2)}</div><div>Payment: ${safe(sale.paymentMethod)}${sale.paymentReference?` (${safe(sale.paymentReference)})`:''}</div>${sale.paymentMethod==='Cash'?`<div>Cash Tendered: ${sym}${Number(sale.cashReceived).toFixed(2)}<br>Change: ${sym}${Number(sale.change).toFixed(2)}</div>`:''}<hr><p class="center muted">${safe(this.posConfig.receiptFooter || 'Thank you!')}</p>`
+          `<h1>${safe(this.posConfig.storeName || 'SALES RECEIPT')}</h1>${this.posConfig.storeAddress?`<div class="center muted">${safe(this.posConfig.storeAddress)}</div>`:''}${this.posConfig.storeTin?`<div class="center muted">TIN: ${safe(this.posConfig.storeTin)}</div>`:''}<hr><div class="muted">Sales Invoice No.: ${safe(sale.invoiceNumber || sale.id)}${sale.voided?' (VOIDED)':''}<br>POS Transaction ID: ${safe(sale.id)}<br>Date: ${safe(new Date(sale.timestamp).toLocaleString())}<br>Cashier: ${safe(sale.actor || 'Operator')}${sale.customerNote?`<br>Note: ${safe(sale.customerNote)}`:''}</div><table><thead><tr><th>Item</th><th>Qty</th><th>Price</th><th>Total</th></tr></thead><tbody>${rows}</tbody></table><div style="text-align:right">Subtotal: ${sym}${Number(sale.subtotal ?? sale.total).toFixed(2)}${Number(sale.discount)>0?`<br>Discount: −${sym}${Number(sale.discount).toFixed(2)}`:''}${Number(sale.taxAmount)>0?`<br>Tax (${Number(sale.taxRate||0)}% ${sale.taxInclusive?'Incl.':'Excl.'}): ${sym}${Number(sale.taxAmount).toFixed(2)}`:''}</div><div class="total">TOTAL: ${sym}${Number(sale.total).toFixed(2)}</div><div>Payment: ${safe(sale.paymentMethod)}${sale.paymentReference?` (${safe(sale.paymentReference)})`:''}</div>${sale.paymentMethod==='Cash'?`<div>Cash Tendered: ${sym}${Number(sale.cashReceived).toFixed(2)}<br>Change: ${sym}${Number(sale.change).toFixed(2)}</div>`:''}<hr><p class="center muted">${safe(this.posConfig.receiptFooter || 'Thank you!')}</p>`
         );
       },
 
@@ -4923,7 +5117,7 @@
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
                   <label class="block text-xs text-neutral-300">Payment Method
                     <select onchange="app.setPosPayment(this.value)" class="mt-1 w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-xs text-white">
-                      ${['Cash','Card','GCash','Maya','Other'].map(method => `<option ${this.posPaymentMethod === method ? 'selected' : ''}>${method}</option>`).join('')}
+                      ${['Cash','QRPH','BDO PAY','ALI PAY','WE CHAT','CHECK',"BOSS IVAN'S CONSIGNMENT",'ONLINE CREDIT CARD','CREDIT CARD','DEBIT CARD'].map(method => `<option ${this.posPaymentMethod === method ? 'selected' : ''}>${method}</option>`).join('')}
                     </select>
                   </label>
                   <label class="block text-xs text-neutral-300">Ref / Customer Note
@@ -4959,7 +5153,7 @@
               ${(this.sales || []).slice(0, 20).map(sale => `<div class="py-2.5 flex flex-wrap items-center justify-between gap-2">
                 <div>
                   <div class="text-xs font-semibold text-white flex items-center gap-2">
-                    <span>${escapeHtml(sale.id)} · ${money(sale.total)}</span>
+                    <span>Invoice ${escapeHtml(sale.invoiceNumber || 'N/A')} · ${money(sale.total)}</span><span class="block text-[9px] text-neutral-500">Transaction ${escapeHtml(sale.id)}</span>
                     ${sale.voided ? '<span class="px-2 py-0.5 rounded bg-rose-500/20 text-rose-300 text-[10px]">VOIDED</span>' : '<span class="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 text-[10px]">PAID</span>'}
                   </div>
                   <div class="text-[10px] text-neutral-500">${escapeHtml(new Date(sale.timestamp).toLocaleString())} · ${escapeHtml(sale.paymentMethod)}${sale.paymentReference ? ` (${escapeHtml(sale.paymentReference)})` : ''} · Cashier: ${escapeHtml(sale.actor || 'Operator')}</div>
@@ -6793,9 +6987,12 @@
             { id: 'operations', label: 'Stock Operations', icon: 'package-plus' },
             { id: 'bulk', label: 'Bulk Update', icon: 'clipboard-paste' },
           ]},
+          { label: 'Sales & Reporting', items: [
+            { id: 'category-mapping', label: 'DSR / CSR Category Mapping', icon: 'list-tree' },
+            { id: 'sales-reports', label: 'DSR / CSR Live Workbook', icon: 'file-spreadsheet' },
+          ]},
           { label: 'Analytics & Audit', items: [
             { id: 'insights', label: 'Insights & Backups', icon: 'chart-no-axes-combined' },
-            { id: 'sales-reports', label: 'Sales Reports', icon: 'chart-column' },
             { id: 'activity-log', label: `Activity Log (${this.activityLogs.length})`, icon: 'clipboard-list' },
             { id: 'integrity', label: 'OpenXML Integrity Check', icon: 'shield-check' },
           ]},
@@ -6860,7 +7057,7 @@
         const container = document.getElementById('main-view-container');
         const stageTitle = document.getElementById('secondary-stage-title');
         if (!container) return;
-        document.body.classList.toggle('uis-edge-view', this.activeView === 'workspace' || this.activeView === 'activity-log' || this.activeView === 'sales-reports');
+        document.body.classList.toggle('uis-edge-view', this.activeView === 'workspace' || this.activeView === 'activity-log' || this.activeView === 'sales-reports' || this.activeView === 'category-mapping');
         document.body.classList.toggle('uis-pos-view', this.activeView === 'pos');
         document.body.classList.toggle('uis-scanner-view', this.activeView === 'scanner');
         document.body.classList.toggle('uis-workspace-view', this.activeView === 'workspace');
@@ -6887,8 +7084,14 @@
           if (window.lucide) lucide.createIcons();
           return;
         }
+        if (this.activeView === 'category-mapping') {
+          if (stageTitle) stageTitle.textContent = 'DSR / CSR Category Sales Mapping';
+          this.renderPosCategoryMappingView(container);
+          if (window.lucide) lucide.createIcons();
+          return;
+        }
         if (this.activeView === 'sales-reports') {
-          if (stageTitle) stageTitle.textContent = 'Sales Reports';
+          if (stageTitle) stageTitle.textContent = 'DSR / CSR Live Workbook';
           this.renderSalesReportsView(container);
           if (window.lucide) lucide.createIcons();
           return;
@@ -7183,7 +7386,21 @@
             this._gridSearchMatchedRows = data.matches.map(i => this._gridSearchCache[i]);
             this._gridSearchMatchedQuery = data.query;
             if (this.activeView === 'workspace' && this.searchQuery.trim() === data.query.trim()) {
+              // Re-render the virtual grid without sacrificing the mobile keyboard / caret.
+              const searchInput = document.getElementById('worksheet-grid-search');
+              const hadFocus = !!searchInput && document.activeElement === searchInput;
+              const caretStart = hadFocus && typeof searchInput.selectionStart === 'number' ? searchInput.selectionStart : null;
+              const caretEnd = hadFocus && typeof searchInput.selectionEnd === 'number' ? searchInput.selectionEnd : caretStart;
               this.renderMainView();
+              if (hadFocus) {
+                const replacement = document.getElementById('worksheet-grid-search');
+                if (replacement) {
+                  replacement.focus({ preventScroll: true });
+                  if (caretStart !== null && typeof replacement.setSelectionRange === 'function') {
+                    try { replacement.setSelectionRange(caretStart, caretEnd); } catch (_) {}
+                  }
+                }
+              }
             }
           };
           this._gridSearchWorker.onerror = () => { try { this._gridSearchWorker.terminate(); } catch (_) {} this._gridSearchWorker = null; };
@@ -7217,7 +7434,12 @@
         if (!query.trim()) {
           this._gridSearchMatchedRows = null;
           this._gridSearchMatchedQuery = '';
-          this._gridSearchTimer = setTimeout(() => this.renderMainView(), 80);
+          this._gridSearchTimer = setTimeout(() => {
+            const searchInput = document.getElementById('worksheet-grid-search');
+            const hadFocus = !!searchInput && document.activeElement === searchInput;
+            this.renderMainView();
+            if (hadFocus) document.getElementById('worksheet-grid-search')?.focus({ preventScroll: true });
+          }, 40);
           return;
         }
         this.buildGridSearchIndex();
@@ -7232,7 +7454,7 @@
             this._gridSearchMatchedQuery = query;
             if (this.activeView === 'workspace') this.renderMainView();
           }
-        }, 200);
+        }, 65);
       },
 
       async openGridSearchResult(sheetIdx, rowNumber, workbookIdx = this.activeWorkbookTabIndex || 0) {
@@ -7617,7 +7839,10 @@
           taxRatePercent: 0,
           taxInclusive: true,
           receiptFooter: 'Thank you for your purchase!',
-          startingCashFloat: 0
+          startingCashFloat: 0,
+          invoiceNumberStart: '1',
+          invoiceNumberNext: '1',
+          categoryMappings: {}
         };
         if (this.activeView === 'settings') this.renderMainView();
         this.showToast('POS & theme settings reset to defaults.');
@@ -7636,6 +7861,67 @@
           receiptFooter: String(document.getElementById('cfg-receipt-footer')?.value || '').trim()
         });
         this.showToast('POS Store & Receipt settings saved locally.', 'success');
+      },
+
+      renderPosCategoryMappingView(container) {
+        const workbooks = this.getWorkspaceWorkbooks();
+        const options = this.getPosCategoryOptions();
+        const mappings = this.posConfig?.categoryMappings || {};
+        const categorySelect = (key, selected, label) => `
+          <label class="flex min-w-0 items-center gap-2" onclick="event.stopPropagation()">
+            <span class="sr-only">${escapeHtml(label)}</span>
+            <select aria-label="${escapeHtml(label)}" class="w-full min-w-0 rounded-lg px-3 py-2 text-xs" style="background:var(--uis-surface);color:var(--uis-text);border:1px solid var(--uis-line)" onchange="app.setPosCategoryMapping(${escapeHtml(JSON.stringify(key))},this.value)">
+              <option value="">Use worksheet / product category</option>
+              ${options.map(option => `<option value="${escapeHtml(option)}" ${selected === option ? 'selected' : ''}>${escapeHtml(option)}</option>`).join('')}
+            </select>
+          </label>`;
+        const workbookCards = workbooks.map((wb, index) => {
+          const workbookName = String(wb?.filename || `Workbook ${index + 1}`);
+          const workbookKey = `${workbookName}::*`;
+          const workbookCategory = String(mappings[workbookKey] || '');
+          const sheets = Array.isArray(wb?.worksheets) ? wb.worksheets : [];
+          const mappedSheets = sheets.filter(ws => !!mappings[`${workbookName}::${String(ws.sheetName || '')}`]).length;
+          const workbookMapped = !!workbookCategory;
+          return `
+            <details class="rounded-2xl overflow-hidden" style="background:var(--uis-surface);border:1px solid var(--uis-line)">
+              <summary class="list-none cursor-pointer p-3 sm:p-4 flex flex-col sm:flex-row sm:items-center gap-3 hover:bg-white/5">
+                <span class="flex min-w-0 flex-1 items-center gap-3">
+                  <span class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl" style="background:var(--uis-surface-2);color:var(--uis-accent)"><i data-lucide="file-spreadsheet" class="w-5 h-5"></i></span>
+                  <span class="min-w-0"><span class="block truncate text-sm font-semibold">${escapeHtml(workbookName)}</span><span class="block text-[10px] mt-0.5" style="color:var(--uis-muted)">${sheets.length} worksheet${sheets.length === 1 ? '' : 's'} · ${mappedSheets} worksheet mapping${mappedSheets === 1 ? '' : 's'} · ${workbookMapped ? 'Workbook category assigned' : 'Workbook category not assigned'}</span></span>
+                  <i data-lucide="chevron-down" class="w-4 h-4 shrink-0 opacity-60"></i>
+                </span>
+                <span class="grid grid-cols-1 sm:grid-cols-[auto_minmax(190px,240px)] gap-2 items-center sm:w-auto w-full" onclick="event.stopPropagation()">
+                  <span class="text-[10px] font-semibold uppercase tracking-wider" style="color:var(--uis-muted)">Entire workbook category</span>
+                  ${categorySelect(workbookKey, workbookCategory, `Entire workbook ${workbookName} category`)}
+                </span>
+              </summary>
+              <div class="border-t p-3 sm:p-4 space-y-2" style="border-color:var(--uis-line)">
+                <div class="flex items-center justify-between gap-2 mb-2"><span class="text-[11px] font-semibold" style="color:var(--uis-muted)">Worksheets inside this workbook</span><span class="text-[10px] opacity-60">Worksheet mapping overrides workbook mapping</span></div>
+                ${sheets.length ? sheets.map((ws, sheetIndex) => {
+                  const sheetName = String(ws?.sheetName || `Worksheet ${sheetIndex + 1}`);
+                  const sheetKey = `${workbookName}::${sheetName}`;
+                  const selected = String(mappings[sheetKey] || '');
+                  const effective = selected || workbookCategory || 'Auto-detect';
+                  return `<div class="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_minmax(190px,240px)] gap-2 items-center rounded-xl p-3" style="background:var(--uis-surface-2);border:1px solid var(--uis-line)"><span class="min-w-0"><span class="block text-xs font-semibold truncate">${escapeHtml(sheetName)}</span><span class="block text-[10px] mt-0.5" style="color:var(--uis-muted)">Effective category: ${escapeHtml(effective)}</span></span>${categorySelect(sheetKey, selected, `Worksheet ${sheetName} category`)}</div>`;
+                }).join('') : `<p class="text-xs opacity-60">This workbook has no worksheets available to map.</p>`}
+              </div>
+            </details>`;
+        }).join('');
+        const summary = this.getPosCategorySalesSummary();
+        container.innerHTML = `
+          <div class="max-w-5xl mx-auto w-full space-y-5">
+            <section class="rounded-2xl p-4 sm:p-5 space-y-2" style="background:var(--uis-surface);border:1px solid var(--uis-line)">
+              <div class="flex items-start gap-3"><span class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl" style="background:var(--uis-surface-2);color:var(--uis-accent)"><i data-lucide="list-tree" class="w-5 h-5"></i></span><div><h2 class="text-base font-semibold">DSR / CSR Category Sales Mapping</h2><p class="text-xs mt-1 leading-relaxed" style="color:var(--uis-muted)">Choose a category for an entire imported workbook, or expand it to assign categories to individual worksheets. A worksheet mapping takes priority over its workbook mapping. If neither is set, the POS checks a matching Category / Product Category cell, then the worksheet name, and finally uses Others.</p></div></div>
+              <div class="flex flex-wrap gap-2 pt-2"><span class="rounded-lg px-2.5 py-1.5 text-[10px]" style="background:var(--uis-surface-2)">${workbooks.length} imported workbook${workbooks.length === 1 ? '' : 's'}</span><span class="rounded-lg px-2.5 py-1.5 text-[10px]" style="background:var(--uis-surface-2)">${workbooks.reduce((n,wb)=>n+(wb?.worksheets?.length||0),0)} worksheets</span><span class="rounded-lg px-2.5 py-1.5 text-[10px]" style="background:var(--uis-surface-2)">Mappings save automatically</span></div>
+            </section>
+            <section class="space-y-3">
+              ${workbooks.length ? workbookCards : `<div class="rounded-2xl p-6 text-center space-y-3" style="background:var(--uis-surface);border:1px dashed var(--uis-line)"><i data-lucide="folder-open" class="w-8 h-8 mx-auto opacity-50"></i><div class="text-sm font-semibold">No imported workbooks yet</div><p class="text-xs" style="color:var(--uis-muted)">Import one or more Excel workbooks. Each workbook will appear here, collapsed by default, with its worksheets inside.</p><button type="button" onclick="document.getElementById('file-upload-input').click()" class="rounded-xl px-4 py-2 text-xs font-bold" style="background:var(--uis-accent);color:#111">Import Excel workbook</button></div>`}
+            </section>
+            <section class="rounded-2xl p-4 sm:p-5 space-y-3" style="background:var(--uis-surface);border:1px solid var(--uis-line)">
+              <div><h3 class="text-sm font-semibold">Current POS Category Sales</h3><p class="text-[10px] mt-1" style="color:var(--uis-muted)">Non-voided completed sales, grouped using the current workbook and worksheet mappings.</p></div>
+              ${summary.length ? `<div class="divide-y" style="border-color:var(--uis-line)">${summary.map(entry=>`<div class="flex items-center justify-between gap-3 py-2 text-xs"><span>${escapeHtml(entry.category)}</span><strong class="font-mono">${escapeHtml(this.formatMoney(entry.amount))}</strong></div>`).join('')}</div>` : `<p class="text-xs opacity-60">Completed POS sales will appear here after checkout.</p>`}
+            </section>
+          </div>`;
       },
 
       renderThemeSettingsView(container) {
@@ -7690,6 +7976,21 @@
                   <button type="submit" class="rounded-xl bg-emerald-500 px-5 py-2.5 text-xs font-bold text-slate-950">Save POS Settings</button>
                 </div>
               </form>
+            </section>
+
+            <section class="rounded-2xl p-4 sm:p-5 space-y-3" style="background:var(--uis-surface);border:1px solid var(--uis-line)">
+              <div>
+                <div class="text-base font-semibold">Sales Invoice Numbering</div>
+                <p class="text-xs mt-1" style="color:var(--uis-muted)">Set the starting invoice number. Every completed transaction receives the next number automatically. The sequence is saved on this device and only resets when you change this starting number.</p>
+              </div>
+              <form onsubmit="app.saveInvoiceNumberingFromForm(event)" class="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] gap-3 items-end">
+                <label class="text-xs">Starting sales invoice number
+                  <input id="cfg-invoice-start" type="text" maxlength="32" value="${escapeHtml(c.invoiceNumberStart || '1')}" placeholder="e.g. 100001 or SI-000001" class="mt-1 w-full px-3 py-2 font-mono" required />
+                </label>
+                <div class="text-xs"><span style="color:var(--uis-muted)">Next invoice to issue</span><div class="mt-1 rounded-lg px-3 py-2 font-mono font-bold" style="background:var(--uis-surface-2)">${escapeHtml(c.invoiceNumberNext || c.invoiceNumberStart || '1')}</div></div>
+                <button type="submit" class="rounded-xl px-5 py-2.5 text-xs font-bold" style="background:var(--uis-accent);color:#111">Save Starting Number</button>
+              </form>
+              <p class="text-[10px]" style="color:var(--uis-muted)">Examples: 1001 → 1002 → 1003; SI-0001 → SI-0002 → SI-0003. Previously issued invoice numbers are not changed.</p>
             </section>
 
             <section class="rounded-2xl p-4 sm:p-5 space-y-3" style="background:var(--uis-surface);border:1px solid var(--uis-line)">
@@ -7945,7 +8246,16 @@
         this.salesReportImports = Array.isArray(record?.imports) ? record.imports : [];
         this.salesReportMapping = record?.mapping && typeof record.mapping === 'object' ? record.mapping : null;
         this.salesReportWorkbook = record?.sourceWorkbook && Array.isArray(record.sourceWorkbook.sheets) ? record.sourceWorkbook : null;
-        this.salesReportSheetName = String(record?.sourceSheetName || this.salesReportWorkbook?.sheets?.[0]?.name || '');
+        const adaptedSavedWorkbook = this.adaptDsrCsrWorkbookToDeviceMonth(this.salesReportWorkbook);
+        const savedSheetName = String(record?.sourceSheetName || '');
+        const savedDailyMatch = /^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/.exec(savedSheetName);
+        const deviceNowForSheet = new Date();
+        const remappedSavedSheetName = savedDailyMatch
+          ? `${deviceNowForSheet.getMonth()+1}-${Number(savedDailyMatch[2])}-${deviceNowForSheet.getFullYear()}`
+          : savedSheetName;
+        this.salesReportSheetName = remappedSavedSheetName && this.salesReportWorkbook?.sheets?.some(sh => sh.name === remappedSavedSheetName)
+          ? remappedSavedSheetName
+          : String(this.salesReportWorkbook?.sheets?.[0]?.name || '');
         this.salesReportCategoryColumns = Array.isArray(record?.categoryColumns) ? record.categoryColumns.map(Number) : [...(this.salesReportMapping?.categoryColumns || [])];
         this.salesReportImportAllDated = !!record?.importAllDated;
         if (this.salesReportWorkbook) {
@@ -7956,6 +8266,7 @@
           this.salesReportMapping = this.defaultSalesReportMapping(this.salesReportSheetName);
           this.salesReportCategoryColumns = [...(this.salesReportMapping.categoryColumns || [])];
         }
+        if (adaptedSavedWorkbook) await this.saveSalesReportStore();
       },
 
       async saveSalesReportStore() {
@@ -8151,7 +8462,38 @@
         return labels;
       },
 
+      isDsrCsr2026Template(workbook = this.salesReportWorkbook) {
+        const names = new Set((workbook?.sheets || []).map(sheet => String(sheet?.name || '').trim().toLowerCase()));
+        const hasSummary = names.has('csr summary');
+        const hasCategorySheet = names.has('new cat sales');
+        const hasDailySheets = [...names].some(name => /^(\d{1,2})-(\d{1,2})-\d{4}$/.test(name));
+        return hasSummary && hasCategorySheet && hasDailySheets;
+      },
+
+      getDsrCsr2026AutoMapping(sheetName) {
+        const datedSheet = /^(\d{1,2})-(\d{1,2})-(\d{4})$/.test(String(sheetName || ''));
+        const categoryCols = Array.from({ length: 26 }, (_, index) => index + 3); // D:AC, zero-based
+        if (datedSheet) return {
+          headerRow: 3, subHeaderRow: 4, columnHeaderRows: {}, dateCol: -2,
+          amountCol: 1, categoryCol: -1, quantityCol: 2, transactionCountCol: -1,
+          categoryColumns: categoryCols, columnRules: {}, template: 'DSR_CSR_2026'
+        };
+        if (String(sheetName || '').trim().toLowerCase() === 'new cat sales') return {
+          headerRow: 3, subHeaderRow: 4, columnHeaderRows: {}, dateCol: 0,
+          amountCol: 29, categoryCol: -1, quantityCol: 2, transactionCountCol: 1,
+          categoryColumns: categoryCols, columnRules: {}, template: 'DSR_CSR_2026'
+        };
+        if (String(sheetName || '').trim().toLowerCase() === 'csr summary') return {
+          headerRow: 5, subHeaderRow: 0, columnHeaderRows: {}, dateCol: -2,
+          amountCol: 1, categoryCol: 2, quantityCol: 3, transactionCountCol: -1,
+          categoryColumns: [], columnRules: {}, template: 'DSR_CSR_2026'
+        };
+        return null;
+      },
+
       defaultSalesReportMapping(sheetName) {
+        const fixedTemplateMapping = this.isDsrCsr2026Template() ? this.getDsrCsr2026AutoMapping(sheetName) : null;
+        if (fixedTemplateMapping) return fixedTemplateMapping;
         const sheet = (this.salesReportWorkbook?.sheets || []).find(s => s.name === sheetName);
         const rows = sheet?.rows || [];
         const headerRow = this.inferSalesReportHeaderRow(rows);
@@ -8184,6 +8526,77 @@
         return { headerRow, subHeaderRow, columnHeaderRows: {}, dateCol: dateCol >= 0 ? dateCol : (sheetDate ? -2 : -1), amountCol, categoryCol, quantityCol, transactionCountCol, categoryColumns, columnRules: {} };
       },
 
+      adaptDsrCsrWorkbookToDeviceMonth(workbook = this.salesReportWorkbook) {
+        if (!workbook || !Array.isArray(workbook.sheets)) return false;
+        const sheets = workbook.sheets;
+        const datedPattern = /^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/;
+        const datedSheets = sheets.filter(sh => datedPattern.test(String(sh?.name || '').trim()));
+        const names = new Set(sheets.map(sh => String(sh?.name || '').trim().toLowerCase()));
+        if (!names.has('csr summary') || !names.has('new cat sales') || !datedSheets.length) return false;
+        const now = new Date();
+        const year = now.getFullYear();
+        const monthIndex = now.getMonth();
+        const monthNumber = monthIndex + 1;
+        const daysInMonth = new Date(year, monthNumber, 0).getDate();
+        const monthKey = `${year}-${String(monthNumber).padStart(2, '0')}`;
+        const alreadyCurrent = datedSheets.length === daysInMonth && datedSheets.every(sh => {
+          const match = datedPattern.exec(String(sh.name).trim());
+          return Number(match[1]) === monthNumber && Number(match[3]) === year;
+        });
+        if (alreadyCurrent && workbook._uisDeviceMonth === monthKey) return false;
+
+        const byDay = new Map();
+        datedSheets.forEach(sh => {
+          const match = datedPattern.exec(String(sh.name).trim());
+          if (match) byDay.set(Number(match[2]), sh);
+        });
+        const fallback = byDay.get(1) || datedSheets[0];
+        const makeCopy = source => JSON.parse(JSON.stringify(source));
+        const nextDailySheets = [];
+        for (let day = 1; day <= daysInMonth; day++) {
+          const source = byDay.get(day) || fallback;
+          const copy = makeCopy(source);
+          copy.name = `${monthNumber}-${day}-${year}`;
+          copy.state = copy.state || 'visible';
+          nextDailySheets.push(copy);
+        }
+        const firstDailyIndex = Math.min(...datedSheets.map(sh => sheets.indexOf(sh)));
+        const retained = sheets.filter(sh => !datedSheets.includes(sh));
+        retained.splice(firstDailyIndex, 0, ...nextDailySheets);
+        workbook.sheets = retained;
+        workbook._uisDeviceMonth = monthKey;
+        const monthName = now.toLocaleString(undefined, { month: 'long' });
+        workbook.sheets.forEach(sh => {
+          if (!Array.isArray(sh.rows)) return;
+          if (/^\d{1,2}-\d{1,2}-\d{4}$/.test(sh.name)) {
+            if (!Array.isArray(sh.rows[0])) sh.rows[0] = [];
+            sh.rows[0][0] = `DAILY SALES REPORT FOR THE MONTH OF ${monthName} ${year}`;
+          } else if (/^new cat sales$/i.test(sh.name)) {
+            if (!Array.isArray(sh.rows[0])) sh.rows[0] = [];
+            sh.rows[0][0] = `Category Sales Report - Month of ${monthName} ${year}`;
+          }
+        });
+
+        // Keep the template's formula references aligned with the generated daily sheet names.
+        const replaceFormulaDates = value => String(value || '').replace(/(\d{1,2})[-/](\d{1,2})[-/](\d{4})/g, (_all, _oldMonth, day) => `${monthNumber}-${Number(day)}-${year}`);
+        workbook.sheets.forEach(sh => {
+          if (Array.isArray(sh.formulas)) sh.formulas = sh.formulas.map(row => Array.isArray(row) ? row.map(formula => replaceFormulaDates(formula)) : row);
+          if (Array.isArray(sh.rows) && /^(new cat sales|csr summary)$/i.test(sh.name)) {
+            // The daily rows in the supplied template are day-numbered. Keep those labels
+            // synchronized with the active device month and blank dates that do not exist.
+            // Arrays are zero-based: NEW CAT SALES day 1 is Excel row 5 (index 4),
+            // while CSR SUMMARY day 1 is Excel row 3 (index 2).
+            const startRow = /^new cat sales$/i.test(sh.name) ? 3 : 1;
+            for (let day = 1; day <= 31; day++) {
+              const rowIndex = startRow + day;
+              if (!Array.isArray(sh.rows[rowIndex])) sh.rows[rowIndex] = [];
+              sh.rows[rowIndex][0] = day <= daysInMonth ? day : '';
+            }
+          }
+        });
+        return true;
+      },
+
       async handleSalesReportFileSelect(input) {
         const file = input?.files?.[0];
         if (input) input.value = '';
@@ -8198,18 +8611,26 @@
           const parsedWorkbook = await this.readSalesReportFile(file, sourceBuffer);
           const sheets = parsedWorkbook.sheets || [];
           this.salesReportWorkbook = { fileName: file.name, fileSize: file.size, originalBuffer: sourceBuffer, _salesFormattingVersion: 2, styles: parsedWorkbook.styles || {}, sheets };
+          this.adaptDsrCsrWorkbookToDeviceMonth(this.salesReportWorkbook);
+          const adaptedSheets = this.salesReportWorkbook.sheets;
+          sheets.splice(0, sheets.length, ...adaptedSheets);
           if (previousFileName !== file.name) { this.salesGridScrollTop=0; this.salesGridScrollLeft=0; this.salesGridStartIndex=-1; this.salesGridSearchQuery=''; this.salesGridEditedOnly=false; }
           const firstVisibleSheet = sheets.find(sh => sh.state !== 'hidden' && sh.state !== 'veryHidden') || sheets[0];
           this.salesReportSheetName = previousFileName === file.name && sheets.some(sh => sh.name === previousSheetName && sh.state !== 'hidden' && sh.state !== 'veryHidden') ? previousSheetName : firstVisibleSheet.name;
           const selectedSheet = sheets.find(sh => sh.name === this.salesReportSheetName) || firstVisibleSheet;
           this.gridZoom = Math.max(0.5, Math.min(2, (Number(selectedSheet.zoomScale) || 100) / 100));
+          const isFixedDsrTemplate = this.isDsrCsr2026Template(this.salesReportWorkbook);
           const defaultMapping = this.defaultSalesReportMapping(this.salesReportSheetName);
-          this.salesReportMapping = previousFileName === file.name && previousMapping ? { ...defaultMapping, ...previousMapping, columnRules: { ...(defaultMapping.columnRules || {}), ...(previousMapping.columnRules || {}) } } : defaultMapping;
+          // The supplied 2026 DSR/CSR workbook has a fixed, known cell layout.
+          // Always use its built-in template map rather than carrying old manual column choices forward.
+          this.salesReportMapping = isFixedDsrTemplate
+            ? defaultMapping
+            : (previousFileName === file.name && previousMapping ? { ...defaultMapping, ...previousMapping, columnRules: { ...(defaultMapping.columnRules || {}), ...(previousMapping.columnRules || {}) } } : defaultMapping);
           this.salesReportCategoryColumns = [...(this.salesReportMapping.categoryColumns || [])];
           this.salesReportImportAllDated = previousFileName === file.name ? previousImportAllDated : false;
           await this.saveSalesReportStore();
           this.renderMainView();
-          this.showToast(`Loaded ${sheets.length} sales worksheet(s). The source grid is ready for mapping.`, 'success');
+          this.showToast(isFixedDsrTemplate ? `Loaded ${sheets.length} worksheets. The 2026 DSR/CSR template was recognized and mapped automatically.` : `Loaded ${sheets.length} sales worksheet(s). Review the automatic column suggestions.`, 'success');
         } catch (error) {
           this.showToast(error?.message || 'Could not read the sales file.', 'error');
         }
@@ -8773,6 +9194,261 @@
         this.renderMainView();
       },
 
+      getDsrCsrDailySheetDateKey(sheetName) {
+        const name = String(sheetName || '').trim();
+        let match = /^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/.exec(name);
+        if (match) return `${match[3]}-${String(Number(match[1])).padStart(2,'0')}-${String(Number(match[2])).padStart(2,'0')}`;
+        match = /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/.exec(name);
+        if (match) return `${match[1]}-${String(Number(match[2])).padStart(2,'0')}-${String(Number(match[3])).padStart(2,'0')}`;
+        return '';
+      },
+
+      getDsrCsrSalesForDate(dateKey) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(String(dateKey || ''))) return [];
+        const books = this.getWorkspaceWorkbooks?.() || [];
+        const pool = [
+          ...(Array.isArray(this.sales) ? this.sales : []),
+          ...(Array.isArray(this.workbook?._uisSession?.sales) ? this.workbook._uisSession.sales : []),
+          ...books.flatMap(wb => Array.isArray(wb?._uisSession?.sales) ? wb._uisSession.sales : [])
+        ];
+        const byId = new Map();
+        pool.forEach((sale, index) => {
+          if (!sale || sale.voided || !Array.isArray(sale.lines) || !sale.lines.length) return;
+          const key = String(sale.id || `${sale.invoiceNumber || sale.invoiceNo || ''}|${sale.timestamp || sale.createdAt || index}`);
+          const prior = byId.get(key);
+          // Prefer the fullest saved copy when a transaction exists in more than one workbook session.
+          if (!prior || (sale.lines.length > prior.lines.length) || (!prior.invoiceNumber && sale.invoiceNumber)) byId.set(key, sale);
+        });
+        const toLocalDateKey = sale => {
+          const explicit = [sale.businessDate, sale.localDate, sale.saleDate].map(v => String(v || '').trim()).find(v => /^\d{4}-\d{2}-\d{2}$/.test(v));
+          if (explicit) return explicit;
+          const raw = sale.timestamp ?? sale.createdAt ?? sale.dateTime ?? sale.date;
+          if (typeof raw === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw.trim())) return raw.trim();
+          const parsed = raw instanceof Date ? raw : new Date(raw);
+          if (!Number.isFinite(parsed.getTime())) return '';
+          return `${parsed.getFullYear()}-${String(parsed.getMonth()+1).padStart(2,'0')}-${String(parsed.getDate()).padStart(2,'0')}`;
+        };
+        return [...byId.values()]
+          .filter(sale => toLocalDateKey(sale) === dateKey)
+          .sort((a,b) => new Date(a.timestamp || a.createdAt || 0).getTime() - new Date(b.timestamp || b.createdAt || 0).getTime());
+      },
+
+      applyDsrCsrDailyInvoiceDetails(sheetName) {
+        const workbook = this.salesReportWorkbook;
+        const sheet = (workbook?.sheets || []).find(sh => sh.name === sheetName);
+        const dateKey = this.getDsrCsrDailySheetDateKey(sheetName);
+        if (!sheet || !dateKey || !this.isDsrCsr2026Template(workbook)) return 0;
+        if (!Array.isArray(sheet.rows)) sheet.rows = [];
+        const sales = this.getDsrCsrSalesForDate(dateKey);
+        const entries = [];
+        sales.forEach(sale => (sale.lines || []).forEach(line => entries.push({ sale, line })));
+        const maxRows = Math.max(Number(sheet._uisLiveDetailRowCount) || 0, entries.length);
+        // Clear only the rows previously written by this live POS overlay. This prevents
+        // voided/removed lines from lingering while preserving the template's other cells.
+        for (let i = 0; i < maxRows && i < 1496; i++) {
+          const rowIndex = 4 + i;
+          if (!Array.isArray(sheet.rows[rowIndex])) sheet.rows[rowIndex] = [];
+          sheet.rows[rowIndex][0] = '';
+          sheet.rows[rowIndex][1] = '';
+          sheet.rows[rowIndex][2] = '';
+        }
+        entries.slice(0,1496).forEach(({ sale, line }, index) => {
+          const rowIndex = 4 + index; // Excel row 5 is zero-based row index 4.
+          if (!Array.isArray(sheet.rows[rowIndex])) sheet.rows[rowIndex] = [];
+          const invoice = String(sale.invoiceNumber || sale.salesInvoiceNumber || sale.invoiceNo || sale.id || '').trim();
+          const itemName = String(line.itemName || line.name || '').trim();
+          const savedDescription = String(line.description || line.itemDescription || line.productDescription || '').replace(/\s+/g,' ').trim();
+          let description = savedDescription && savedDescription !== itemName ? savedDescription : '';
+          if (!description) {
+            const inventoryBooks = this.getWorkspaceWorkbooks?.() || [];
+            const sourceWorkbook = inventoryBooks[Number(line.workbookIdx)] || inventoryBooks.find(wb => String(wb.filename || '') === String(line.workbookName || ''));
+            const sourceSheet = sourceWorkbook?.worksheets?.find(ws => String(ws.sheetName || '') === String(line.sheetName || ''));
+            const sourceRecord = sourceSheet?.records?.find(rec => Number(rec.rowNumber) === Number(line.rowNumber));
+            description = this.getPosInventoryDescription({
+              workbookIdx: line.workbookIdx, workbookName: line.workbookName, sheetName: line.sheetName,
+              rowNumber: line.rowNumber, itemName, sheet: sourceSheet, record: sourceRecord
+            });
+          }
+          description = String(description || itemName || '').replace(/\s+/g,' ').trim();
+          sheet.rows[rowIndex][0] = invoice;
+          sheet.rows[rowIndex][1] = description;
+          sheet.rows[rowIndex][2] = Number(line.quantity) || 0;
+        });
+        sheet._uisLiveDetailRowCount = Math.min(entries.length,1496);
+        sheet.maxRows = Math.max(Number(sheet.maxRows) || 0, 4 + sheet._uisLiveDetailRowCount);
+        return entries.length;
+      },
+
+      getDsrCsrLiveCellOverrides(sheetName) {
+        const overrides = new Map();
+        const workbook = this.salesReportWorkbook;
+        if (!workbook || !sheetName || !this.isDsrCsr2026Template(workbook)) return overrides;
+        const money = value => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
+        const dateKeyForSheet = name => this.getDsrCsrDailySheetDateKey(name);
+        const categoryColumns = {
+          'singles':4,'gnr':5,'gns':6,'local':7,'local comics':7,'hot toys':8,'cosbaby':9,'cosbi(cbx)':10,
+          'funko':11,'loungefly':12,'rokimoto':13,'urdu':14,'flotaku':15,'pop mart':16,'52 toys':17,
+          'muse/nullset':18,'muse/null set':18,'pyramid':19,'toys':20,'banpresto':21,'blokees':22,'funism':23,
+          'ohku':24,'top toys':25,'kayou':26,'card fun':27,'kpop':28,'others':29
+        };
+        const norm = value => String(value || '').toLowerCase().replace(/[^a-z0-9]/g,'');
+        const categoryCol = category => categoryColumns[String(category || '').toLowerCase()] || categoryColumns[norm(category)] || 29;
+        const deviceDate = new Date();
+        const reportYear = deviceDate.getFullYear();
+        const reportMonth = deviceDate.getMonth();
+        const daysInReportMonth = new Date(reportYear, reportMonth + 1, 0).getDate();
+        const reportMonthNumber = reportMonth + 1;
+        // Read the transaction ledger from the app state and any workbook session
+        // snapshots. This avoids missing sales when the active workspace restored its
+        // ledger from a workbook session after the POS view was opened.
+        const salePool = [
+          ...(Array.isArray(this.sales) ? this.sales : []),
+          ...((this.getWorkspaceWorkbooks?.() || []).flatMap(wb => Array.isArray(wb?._uisSession?.sales) ? wb._uisSession.sales : []))
+        ];
+        const saleById = new Map();
+        salePool.forEach(sale => {
+          if (!sale || sale.voided || !Array.isArray(sale.lines)) return;
+          const key = String(sale.id || `${sale.invoiceNumber || ''}|${sale.timestamp || sale.createdAt || ''}`);
+          if (key) saleById.set(key, sale);
+        });
+        const allSales = [...saleById.values()];
+        const saleDateKey = sale => {
+          const explicit = String(sale?.businessDate || sale?.localDate || sale?.saleDate || '').trim();
+          if (/^\d{4}-\d{2}-\d{2}$/.test(explicit)) return explicit;
+          const raw = sale?.timestamp ?? sale?.createdAt ?? sale?.dateTime ?? sale?.date;
+          if (typeof raw === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw.trim())) return raw.trim();
+          const d = new Date(raw);
+          return Number.isFinite(d.getTime()) ? `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}` : '';
+        };
+        const salesForDate = dateKey => allSales.filter(sale => saleDateKey(sale) === dateKey);
+        const netLinesForSales = sales => {
+          const out = [];
+          sales.forEach(sale => {
+            const lines = sale.lines || [];
+            const subtotal = lines.reduce((sum,line) => sum + (Number(line.lineTotal) || (Number(line.quantity)||0)*(Number(line.unitPrice)||0)), 0);
+            const declaredSubtotal = Number(sale.subtotal);
+            const base = Number.isFinite(declaredSubtotal) && declaredSubtotal > 0 ? declaredSubtotal : subtotal;
+            lines.forEach(line => {
+              const gross = Number(line.lineTotal) || (Number(line.quantity)||0)*(Number(line.unitPrice)||0);
+              const discount = Math.max(0, Number(sale.discount)||0) * (subtotal > 0 ? gross/subtotal : 0);
+              const net = Math.max(0, gross - discount);
+              out.push({ sale, line, net: money(net), quantity: Number(line.quantity)||0, category: this.getPosCategoryForSource(line.workbookName,line.sheetName,line.category) });
+            });
+          });
+          return out;
+        };
+        const set = (cell, value) => overrides.set(cell, value);
+        const dateKey = dateKeyForSheet(sheetName);
+        if (dateKey) {
+          const sales = salesForDate(dateKey);
+          const lines = netLinesForSales(sales);
+          const categoryTotals = new Map();
+          let quantity = 0, total = 0;
+          lines.forEach(entry => {
+            categoryTotals.set(entry.category, (categoryTotals.get(entry.category)||0) + entry.net);
+            quantity += entry.quantity; total += entry.net;
+          });
+          Object.entries(categoryColumns).forEach(([category,col]) => set(`${colIndexToLetter(col)}2`, money(categoryTotals.get(this.getPosCategoryOptions().find(c=>norm(c)===norm(category)) || category) || 0)));
+          set('B2', money(total)); set('C2', quantity); set('AD2', money(total)); set('AG5', money(total)); set('AG6', new Set(sales.map(s=>s.id)).size);
+          // Live detail rows: one row per POS receipt line, preserving the template's invoice/description/qty/category layout.
+          lines.forEach((entry,index) => {
+            const row = 5 + index;
+            if (row > 1500) return;
+            // The supplied template uses A=Sales Invoice, B=Description, C=Qty.
+            // Write a value on every product row, repeating the invoice per receipt line.
+            const invoiceNo = String(entry.sale.invoiceNumber || entry.sale.salesInvoiceNumber || entry.sale.invoiceNo || entry.sale.id || '').trim();
+            const inventoryDescription = this.getPosInventoryDescription({
+              workbookIdx: entry.line.workbookIdx, workbookName: entry.line.workbookName,
+              sheetName: entry.line.sheetName, rowNumber: entry.line.rowNumber,
+              itemName: entry.line.itemName
+            });
+            const savedDescription = String(entry.line.description || entry.line.itemDescription || entry.line.productDescription || '').replace(/\s+/g,' ').trim();
+            const description = (savedDescription && savedDescription !== String(entry.line.itemName || '').trim())
+              ? savedDescription
+              : String(inventoryDescription || savedDescription || entry.line.itemName || '').replace(/\s+/g,' ').trim();
+            set(`A${row}`, invoiceNo);
+            set(`B${row}`, description);
+            set(`C${row}`, entry.quantity);
+            set(`AD${row}`, entry.net);
+            set(`${colIndexToLetter(categoryCol(entry.category))}${row}`, entry.net);
+          });
+          // Payment totals are shown only where the template explicitly labels a payment row.
+          const paymentAliases = {
+            cash:['cash'], qrph:['qrph'], bdoPay:['bdo pay'], aliPay:['ali pay','alipay'], weChat:['we chat'],
+            check:['check'], bossIvansConsignment:["boss ivan's consignment"], onlineCreditCard:['online credit card'],
+            creditCard:['credit card'], debitCard:['debit card']
+          };
+          const sheet = workbook.sheets.find(sh=>sh.name===sheetName);
+          (sheet?.rows || []).forEach((row,ri) => {
+            const label = String(row?.[31] || '').trim().toLowerCase();
+            if (!label) return;
+            const normalized = norm(label);
+            const match = Object.entries(paymentAliases).find(([key,aliases])=>aliases.some(a=>normalized===norm(a)));
+            if (!match) return;
+            // Exact normalized matching is essential: 'ONLINE CREDIT CARD' must never also match 'CREDIT CARD'.
+            const amount = sales.filter(s=>match[1].some(a=>norm(s.paymentMethod)===norm(a))).reduce((sum,s)=>sum+(Number(s.total)||0),0);
+            set(`AG${ri+1}`, money(amount));
+          });
+          return overrides;
+        }
+        const sheetLower = String(sheetName).toLowerCase();
+        if (sheetLower === 'new cat sales') {
+          const monthly = allSales.filter(sale => {
+            const d = new Date(sale.timestamp); return Number.isFinite(d.getTime()) && d.getFullYear()===reportYear && d.getMonth()===reportMonth;
+          });
+          const totals = new Map();
+          const paymentColumns = {
+            'QRPH': 41, 'BDO PAY': 42, 'ALI PAY': 43, 'WE CHAT': 44, 'CHECK': 45,
+            "BOSS IVAN'S CONSIGNMENT": 46, 'ONLINE CREDIT CARD': 47, 'CREDIT CARD': 48, 'DEBIT CARD': 49
+          };
+          const paymentAliases = {
+            'QRPH':['qrph'], 'BDO PAY':['bdo pay'], 'ALI PAY':['ali pay','alipay'], 'WE CHAT':['we chat'],
+            'CHECK':['check'], "BOSS IVAN'S CONSIGNMENT":["boss ivan's consignment",'boss ivans consignment'],
+            'ONLINE CREDIT CARD':['online credit card','occ'], 'CREDIT CARD':['credit card'], 'DEBIT CARD':['debit card']
+          };
+          const paymentTotal = (sales, aliases) => money(sales.filter(sale => aliases.some(alias => norm(sale.paymentMethod) === norm(alias))).reduce((sum,sale) => sum + (Number(sale.total) || 0), 0));
+          let totalQty=0, totalTxn=0, totalSales=0, totalCash=0;
+          for (let day=1; day<=31; day++) {
+            // NEW CAT SALES uses rows 5-35 for days 1-31 (rows 3-4 are headers).
+            const row = day + 4;
+            if (day > daysInReportMonth) {
+              ['A','B','C','AD','AF','AG','AH','AI','AJ','AL','AM','AO','AP','AQ','AR','AS','AT','AU','AV','AW','AX','AY','AZ','BA','BB','BC','BD','BE','BF','BG'].forEach(col=>set(`${col}${row}`,''));
+              Object.values(categoryColumns).forEach(col => set(`${colIndexToLetter(col)}${row}`, ''));
+              continue;
+            }
+            const dateKeyForDay = `${reportYear}-${String(reportMonthNumber).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
+            const daily = salesForDate(dateKeyForDay); const lines = netLinesForSales(daily);
+            const byCategory = new Map(); let qty=0, daySales=0;
+            lines.forEach(e=>{ byCategory.set(e.category,(byCategory.get(e.category)||0)+e.net); qty+=e.quantity; totals.set(e.category,(totals.get(e.category)||0)+e.net); daySales+=e.net; });
+            set(`A${row}`, day);
+            set(`B${row}`, daily.length);
+            set(`C${row}`, qty);
+            set(`AD${row}`, money(daySales));
+            totalQty += qty; totalTxn += daily.length; totalSales += daySales;
+            Object.entries(categoryColumns).forEach(([cat,col])=>set(`${colIndexToLetter(col)}${row}`, money(byCategory.get(this.getPosCategoryOptions().find(c=>norm(c)===norm(cat)) || cat)||0)));
+            Object.entries(paymentColumns).forEach(([method,col])=>set(`${colIndexToLetter(col)}${row}`, paymentTotal(daily,paymentAliases[method])));
+            const cashAmount = money(daily.filter(sale=>norm(sale.paymentMethod)==='cash').reduce((sum,sale)=>sum+(Number(sale.total)||0),0));
+            set(`BE${row}`, cashAmount);
+            totalCash += cashAmount;
+          }
+          set('B36',totalTxn); set('C36',totalQty); set('AD36',money(totalSales)); set('BE36',money(totalCash));
+          Object.entries(categoryColumns).forEach(([cat,col])=>set(`${colIndexToLetter(col)}36`,money(totals.get(this.getPosCategoryOptions().find(c=>norm(c)===norm(cat)) || cat)||0)));
+          Object.entries(paymentColumns).forEach(([method,col])=>set(`${colIndexToLetter(col)}36`,paymentTotal(monthly,paymentAliases[method])));
+          return overrides;
+        }
+        if (sheetLower === 'csr summary') {
+          const monthly = allSales.filter(sale => { const d=new Date(sale.timestamp); return Number.isFinite(d.getTime()) && d.getFullYear()===reportYear && d.getMonth()===reportMonth; });
+          const lines = netLinesForSales(monthly); const totals = new Map(); let qty=0;
+          lines.forEach(e=>{totals.set(e.category,(totals.get(e.category)||0)+e.net);qty+=e.quantity;});
+          set('D3',qty); set('D4',monthly.length); set('D34',money(lines.reduce((sum,e)=>sum+e.net,0)));
+          const ordered = ['Singles','GNR','GNS','Local','Hot Toys','Cosbaby','Cosbi(CBX)','Funko','Loungefly','Rokimoto','Urdu','Flotaku','Pop Mart','52 Toys','Muse/Nullset','Pyramid','Toys','Banpresto','Blokees','Funism','Ohku','Top Toys','Kayou','Card Fun','KPOP','Others'];
+          ordered.forEach((category,index)=>set(`D${6+index}`,money(totals.get(category)||0)));
+          for(let day=1;day<=31;day++) { if(day>daysInReportMonth) { set(`A${2+day}`, ''); set(`B${2+day}`, ''); continue; } const daily=salesForDate(`${reportYear}-${String(reportMonthNumber).padStart(2,'0')}-${String(day).padStart(2,'0')}`); const linesDay=netLinesForSales(daily); set(`A${2+day}`, day); set(`B${2+day}`,money(linesDay.reduce((sum,e)=>sum+e.net,0))); }
+          return overrides;
+        }
+        return overrides;
+      },
+
       renderSalesReportsView(container) {
         const records = this.getLiveSalesReportRecords();
         let sourceGridHtml = '';
@@ -8780,9 +9456,12 @@
         this.ensureSalesReportFormatting(workbook);
         const mapping = this.salesReportMapping || {};
         const sheet = (workbook?.sheets || []).find(sh => sh.name === this.salesReportSheetName);
+        if (sheet) this.applyDsrCsrDailyInvoiceDetails(this.salesReportSheetName);
         const sourceRows = sheet?.rows || [];
+        const liveCellOverrides = this.getDsrCsrLiveCellOverrides(this.salesReportSheetName);
         const maxColumns = Math.max(sheet?.maxColumns || 0, sourceRows.reduce((max, row) => Math.max(max, (row || []).length), 0));
-        const maxRows = Math.max(sheet?.maxRows || 0, sourceRows.length);
+        const liveMaxRow = [...liveCellOverrides.keys()].reduce((max, ref) => Math.max(max, Number((/\d+$/.exec(ref) || [0])[0]) || 0), 0);
+        const maxRows = Math.max(sheet?.maxRows || 0, sourceRows.length, liveMaxRow);
         if (workbook && sheet) {
           const styles = workbook.styles || {};
           const roleForColumn = index => {
@@ -8848,7 +9527,10 @@
             if (pairedLabel !== undefined) quantityLabelForCol.set(quantityCol, pairedLabel);
           }
           const headerLabels = this.salesReportColumnLabels(this.salesReportSheetName, mapping.headerRow, mapping.subHeaderRow, mapping.columnHeaderRows || {});
-          const mapStrip = `<div class="sr-excel-mapping-strip" style="background:#f3f3f3;color:#202020;border-bottom:1px solid #b8b8b8"><div class="sr-excel-map-title">Column mapping<br/><small>Choose each header row</small></div><div class="sr-excel-map-columns">${displayColumns.map(ci=>{ const headerRow = Number(mapping.columnHeaderRows?.[ci-1]) || Number(mapping.headerRow) || 1; const sourceIndex=ci-1; const headerText = headerLabels[sourceIndex]?.label || `Column ${ci}`; return `<label class="sr-excel-map-item" style="width:${Math.max(84,Math.min(150,widthPx[sourceIndex]))}px"><span>${colIndexToLetter(ci)} · Header row</span><input type="number" min="1" max="${maxRows}" step="1" value="${headerRow}" title="Header cell: ${escapeHtml(headerText)}" aria-label="Header row for column ${colIndexToLetter(ci)}" onchange="app.setSalesReportColumnHeaderRow(${sourceIndex},this.value)"/><select aria-label="Map source column ${colIndexToLetter(ci)}" data-sr-grid-role="${sourceIndex}" onchange="app.setSalesReportColumnRole(${sourceIndex},this.value)">${roles.map(([value,label])=>`<option value="${value}" ${roleForColumn(sourceIndex)===value?'selected':''}>${escapeHtml(label)}</option>`).join('')}</select></label>`;}).join('')}</div></div>`;
+          const isFixedDsrTemplate = this.isDsrCsr2026Template(workbook);
+          const mapStrip = isFixedDsrTemplate
+            ? `<div class="flex items-center gap-2 border-b border-emerald-200 bg-emerald-50 px-3 py-2 text-[11px] text-emerald-900"><span class="inline-flex h-5 w-5 items-center justify-center rounded-full bg-emerald-600 text-white">✓</span><strong>Automatic template mapping applied</strong><span class="text-emerald-800">Daily sheets automatically populate invoice numbers in A5:A1500, item descriptions in B5:B1500, quantities in C5:C1500, and category sales in the mapped columns.</span></div>`
+            : `<div class="sr-excel-mapping-strip" style="background:#f3f3f3;color:#202020;border-bottom:1px solid #b8b8b8"><div class="sr-excel-map-title">Column mapping<br/><small>Choose each header row</small></div><div class="sr-excel-map-columns">${displayColumns.map(ci=>{ const headerRow = Number(mapping.columnHeaderRows?.[ci-1]) || Number(mapping.headerRow) || 1; const sourceIndex=ci-1; const headerText = headerLabels[sourceIndex]?.label || `Column ${ci}`; return `<label class="sr-excel-map-item" style="width:${Math.max(84,Math.min(150,widthPx[sourceIndex]))}px"><span>${colIndexToLetter(ci)} · Header row</span><input type="number" min="1" max="${maxRows}" step="1" value="${headerRow}" title="Header cell: ${escapeHtml(headerText)}" aria-label="Header row for column ${colIndexToLetter(ci)}" onchange="app.setSalesReportColumnHeaderRow(${sourceIndex},this.value)"/><select aria-label="Map source column ${colIndexToLetter(ci)}" data-sr-grid-role="${sourceIndex}" onchange="app.setSalesReportColumnRole(${sourceIndex},this.value)">${roles.map(([value,label])=>`<option value="${value}" ${roleForColumn(sourceIndex)===value?'selected':''}>${escapeHtml(label)}</option>`).join('')}</select></label>`;}).join('')}</div></div>`;
           const colgroup = `<colgroup><col style="width:46px;min-width:46px"/>${displayColumns.map(col=>`<col style="width:${widthPx[col-1]}px;${hiddenColumns[col-1]?'display:none':''}"/>`).join('')}</colgroup>`;
           const letterHeader = `<thead><tr class="sr-excel-col-letters"><th class="sr-excel-row-corner">Row</th>${displayColumns.map((col,pos)=>`<th draggable="true" ondragstart="app.handleSalesGridColumnDragStart(event,${col})" ondragover="app.handleSalesGridColumnDragOver(event)" ondragleave="app.handleSalesGridColumnDragLeave(event)" ondrop="app.handleSalesGridColumnDrop(event,${col})" ondragend="app.handleSalesGridColumnDragEnd()" style="width:${widthPx[col-1]}px;${hiddenColumns[col-1]?'display:none':''}" class="uis-grid-draggable-header"><span>${colIndexToLetter(col)}</span><span class="sr-grid-col-actions"><button type="button" onclick="event.stopPropagation();app.shiftSalesGridColumn(${col},-1)" ${pos===0?'disabled':''}>‹</button><button type="button" onclick="event.stopPropagation();app.shiftSalesGridColumn(${col},1)" ${pos===displayColumns.length-1?'disabled':''}>›</button></span></th>`).join('')}</tr></thead>`;
           const renderSalesRow = ri => {
@@ -8863,7 +9545,9 @@
               if (merge.rowSpan>1) { for(let mr=sourceRow;mr<sourceRow+merge.rowSpan;mr++) if(!renderedRowSet.has(mr)) { merge={...merge,rowSpan:1}; break; } }
               const styleId = sheet.cellStyles?.[ri]?.[ci] ?? sheet.rowStyles?.[ri] ?? sheet.columnStyles?.[ci] ?? 0;
               const cellType = sheet.cellTypes?.[ri]?.[ci] || 'n';
-              const cellValue = row[ci] ?? '';
+              const cellRef = `${colIndexToLetter(ci+1)}${sourceRow}`;
+              const hasLiveOverride = liveCellOverrides.has(cellRef);
+              const cellValue = hasLiveOverride ? liveCellOverrides.get(cellRef) : (row[ci] ?? '');
               const style = salesExcelCellCss(styleId, styles, sheet.showGridLines !== false, cellValue, cellType);
               const mergeRange = (merge.rowSpan > 1 || merge.colSpan > 1) ? { startRow:sourceRow, endRow:sourceRow+merge.rowSpan-1, startCol:ci+1, endCol:ci+merge.colSpan } : null;
               const mergedBorderStyle = mergeRange ? salesExcelMergedBorderCss(sheet, mergeRange, styles, sheet.showGridLines !== false) : '';
@@ -8905,7 +9589,7 @@
               const displayPosition=displayColumns.indexOf(ci+1);
               const stickyLeft = displayPosition >= 0 && displayPosition < (sheet.freezePane?.xSplit || 0) ? `position:sticky;left:${46 + displayColumns.slice(0,displayPosition).reduce((sum,col)=>sum+(widthPx[col-1]||0),0)}px;z-index:3;` : '';
               const cellAlign=salesExcelHorizontalCss(styleId,styles,cellValue,cellType);
-              const isComputedCell=categorySourceCol!==undefined || quantityLabelCol!==undefined;
+              const isComputedCell=categorySourceCol!==undefined || quantityLabelCol!==undefined || hasLiveOverride;
               if (!isLabel && !isComputedCell && !formula) {
                 content = `<input class="sr-excel-cell-editor" aria-label="Cell ${colIndexToLetter(ci+1)}${sourceRow}" type="text" value="${escapeHtml(cellValue)}" onchange="app.editSalesReportCell(${sourceRow},${ci},this.value)" style="text-align:${cellAlign} !important"/>`;
               } else if (formula && !isLabel && !isComputedCell) {
@@ -8929,25 +9613,30 @@
           const isExcelSource = /\.(xlsx|xlsm)$/i.test(workbook.fileName || '');
           const styleNotice = !isExcelSource ? 'CSV source' : (hasExcelStyles ? 'Original Excel formatting loaded' : 'Re-import this workbook once to load its original Excel formatting');
           sourceGridHtml = `<section class="sr-source-panel flex min-h-0 flex-1 flex-col overflow-hidden" style="background:#ffffff;color:#111827">
-            <div class="sr-excel-filebar"><div class="min-w-0"><strong>${escapeHtml(workbook.fileName || 'Sales workbook')}</strong><span>${escapeHtml(this.salesReportSheetName)} · ${maxRows.toLocaleString()} rows × ${maxColumns} columns</span></div><span>${styleNotice} · mapped cells link to inventory/POS</span></div>
-            <div class="sr-excel-settingsbar"><label class="sr-excel-check"><input id="sr-import-all-dated" type="checkbox" ${this.salesReportImportAllDated?'checked':''} onchange="app.setSalesReportImportAllDated(this.checked)"/>Import all date-named sheets</label><button onclick="app.commitSalesReportImport()">Import mapped sheet</button></div>
+            <div class="sr-excel-filebar"><div class="min-w-0"><strong>${escapeHtml(workbook.fileName || 'Sales workbook')}</strong><span>${escapeHtml(this.salesReportSheetName)} · ${maxRows.toLocaleString()} rows × ${maxColumns} columns</span></div><span>${styleNotice} · POS-linked cells update live in this view</span></div>
+            <div class="sr-excel-settingsbar"><label class="sr-excel-check"><input id="sr-import-all-dated" type="checkbox" ${this.salesReportImportAllDated?'checked':''} onchange="app.setSalesReportImportAllDated(this.checked)"/>Import all date-named sheets</label><button onclick="app.commitSalesReportImport()">Import sheet</button></div>
             ${mapStrip}
             <div class="sr-sales-grid-scroll flex-1 min-h-0 overflow-auto" id="sales-source-grid" onscroll="app.handleSalesGridScroll(this)" ontouchstart="app.handleGridTouchStart(event)" ontouchmove="app.handleGridTouchMove(event)" ontouchend="app.handleGridTouchEnd()" ontouchcancel="app.handleGridTouchEnd()" style="touch-action:pan-x pan-y"><table class="sr-excel-sheet" style="zoom:${this.gridZoom || 1};direction:${sheet.rightToLeft?'rtl':'ltr'};${sheet.showGridLines===false?'--sr-gridline:transparent;':''}">${colgroup}${letterHeader}<tbody>${bodyRows || `<tr><td colspan="${maxColumns+1}">This worksheet is empty.</td></tr>`}</tbody></table></div>
             ${sheetTabs}
           </section>`;
         } else {
-          sourceGridHtml = `<section class="flex min-h-0 flex-1 items-center justify-center border-t border-slate-800 bg-slate-950 p-6 text-center"><div><div class="text-sm font-semibold text-slate-200">No sales worksheet loaded</div><div class="mt-1 text-xs text-slate-500">Import a separate Excel or CSV file to display its worksheet grid here.</div><button onclick="document.getElementById('sales-report-file-input').click()" class="mt-3 rounded-lg bg-emerald-700 px-3 py-2 text-xs font-semibold text-white">Import Sales File</button></div></section>`;
+          sourceGridHtml = `<section class="flex min-h-0 flex-1 items-center justify-center border-t border-slate-800 bg-slate-950 p-6 text-center"><div><div class="text-sm font-semibold text-slate-200">No DSR / CSR workbook loaded</div><div class="mt-1 text-xs text-slate-500">Import your DSR, CSR NEW FORMATS 2026.xlsx workbook to preview its sheets and live POS-linked cells.</div><button onclick="document.getElementById('sales-report-file-input').click()" class="mt-3 rounded-lg bg-emerald-700 px-3 py-2 text-xs font-semibold text-white">Import DSR / CSR Workbook</button></div></section>`;
         }
+        const today = new Date();
+        const todayKey = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
+        const todayCategoryTotals = this.getPosCategorySalesSummary(todayKey);
+        const categoryLiveHtml = `<section class="shrink-0 border-b border-slate-800 bg-slate-900/60 px-3 py-2"><div class="mb-2 flex flex-wrap items-center justify-between gap-2"><strong class="text-[11px] text-slate-200">Live POS Category Sales · ${today.toLocaleDateString()}</strong><span class="text-[10px] text-slate-400">Completed, non-voided transactions · discounts allocated · tax excluded</span></div><div class="flex flex-wrap gap-2">${todayCategoryTotals.length ? todayCategoryTotals.map(entry=>`<span class="rounded-lg border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-[10px] text-slate-300">${escapeHtml(entry.category)} <strong class="ml-1 font-mono text-emerald-300">${escapeHtml(this.formatMoney(entry.amount))}</strong></span>`).join('') : `<span class="text-[10px] text-slate-500">No completed sales recorded today.</span>`}</div></section>`;
         container.innerHTML = `<div class="uis-sales-layout flex h-full min-h-0 w-full flex-col overflow-hidden bg-slate-950">
-          <div class="sr-sales-toolbar flex shrink-0 flex-wrap items-center gap-2 border-b border-slate-800 bg-slate-900/80 px-3 py-2">
+          <div class="sr-sales-toolbar flex shrink-0 flex-wrap items-center gap-2 border-b border-slate-800 bg-slate-900/80 px-3 py-2"><span class="mr-1 text-[11px] font-semibold text-emerald-300">DSR / CSR LIVE WORKBOOK</span><span class="text-[10px] text-slate-400">POS-linked cells refresh after each completed or voided sale</span>
             <input id="sales-grid-search" type="search" value="${escapeHtml(this.salesGridSearchQuery || '')}" oninput="app.filterSalesSourceGrid(this.value)" placeholder="Search worksheet cells…" class="min-w-[120px] flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500" />
             <button type="button" onclick="app.toggleSalesGridEditedOnly()" class="rounded-lg border border-slate-700 px-2 py-1.5 text-[10px] ${this.salesGridEditedOnly?'bg-amber-500/20 text-amber-300 border-amber-500/40':'bg-slate-950 text-slate-300'}">Edited only</button>
             <div class="inline-flex items-center gap-1 rounded-lg border border-slate-700 bg-slate-950 p-1"><button type="button" onclick="app.adjustGridZoom(-0.1)" class="h-7 w-7 rounded text-slate-200 hover:bg-slate-800">−</button><span id="grid-zoom-label" class="min-w-[42px] text-center font-mono text-[11px] text-slate-300">${Math.round((this.gridZoom || 1) * 100)}%</span><button type="button" onclick="app.adjustGridZoom(0.1)" class="h-7 w-7 rounded text-slate-200 hover:bg-slate-800">+</button></div>
             <button onclick="document.getElementById('sales-report-file-input').click()" class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-100">Import File</button>
             ${workbook ? `<button onclick="app.clearSalesReportSource()" class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-300">Close file</button>` : ''}
-            <button onclick="app.exportSalesReportCsv()" ${records.length?'':'disabled'} class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-200 disabled:opacity-40">Export CSV</button>
+            <button onclick="app.exportSalesReportWorkbook()" ${workbook ? '' : 'disabled'} class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-200 disabled:opacity-40">Export Excel (.xlsx)</button>
             <input id="sales-report-file-input" type="file" accept=".xlsx,.xlsm,.csv" class="hidden" onchange="app.handleSalesReportFileSelect(this)" />
           </div>
+          ${categoryLiveHtml}
           ${sourceGridHtml}
         </div>`;
         const salesScroller=container.querySelector('#sales-source-grid');
@@ -8991,7 +9680,7 @@
           await this.saveSalesReportStore();
           this.salesReportFilterMonth = 'all';
           this.renderMainView();
-          this.showToast(`Imported ${importedCount.toLocaleString()} sales records from ${mappedBatches.length} worksheet(s). The source workbook remains loaded for review and remapping.`, 'success');
+          this.showToast(`Imported ${importedCount.toLocaleString()} sales records from ${mappedBatches.length} worksheet(s). The source workbook remains loaded for review.`, 'success');
         } catch (error) {
           this.showToast(error?.message || 'Could not save imported sales records.', 'error');
         }
@@ -9006,6 +9695,172 @@
         this.salesReportImports = this.salesReportImports.filter(x => x.id !== id);
         try { await this.saveSalesReportStore(); this.renderMainView(); this.showToast('Imported sales source removed.'); }
         catch (error) { this.showToast(error?.message || 'Could not remove the sales source.', 'error'); }
+      },
+
+      async exportSalesReportWorkbook() {
+        const workbook = this.salesReportWorkbook;
+        if (!workbook?.originalBuffer || !Array.isArray(workbook.sheets) || !window.JSZip) {
+          this.showToast('Import the DSR/CSR Excel workbook before exporting.', 'error'); return;
+        }
+        try {
+          const zip = await window.JSZip.loadAsync(workbook.originalBuffer, { checkCRC32: true });
+          const parser = new DOMParser();
+          const serializer = new XMLSerializer();
+          const workbookXml = zip.file('xl/workbook.xml');
+          const relsXml = zip.file('xl/_rels/workbook.xml.rels');
+          if (!workbookXml || !relsXml) throw new Error('The imported file is not a valid XLSX workbook.');
+          const wbDoc = parser.parseFromString(await workbookXml.async('string'), 'application/xml');
+          const relDoc = parser.parseFromString(await relsXml.async('string'), 'application/xml');
+          const relTargets = {};
+          Array.from(relDoc.getElementsByTagName('Relationship')).forEach(r => relTargets[r.getAttribute('Id')] = r.getAttribute('Target'));
+          let sheetNodes = Array.from(wbDoc.getElementsByTagName('sheet'));
+          const ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+          const relNs = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+          // The live model has already adapted the daily tabs to the device's current
+          // month. Reconcile the workbook XML's original dated tabs to that live list
+          // before exporting, otherwise the renamed sheets never match their XML parts.
+          const datedName = name => { const m=/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/.exec(String(name||'').trim()); return m ? {month:Number(m[1]),day:Number(m[2]),year:Number(m[3])} : null; };
+          const liveDailySheets = (workbook.sheets||[]).filter(sh=>datedName(sh.name)).sort((a,b)=>datedName(a.name).day-datedName(b.name).day);
+          const dailySheetNameMap = new Map();
+          const originalDailyNodes = sheetNodes.filter(node=>datedName(node.getAttribute('name'))).sort((a,b)=>datedName(a.getAttribute('name')).day-datedName(b.getAttribute('name')).day);
+          if (liveDailySheets.length && originalDailyNodes.length) {
+            const dailyByRelId = new Map();
+            originalDailyNodes.forEach((node,index)=>{
+              const oldName=node.getAttribute('name');
+              const rid=node.getAttribute('r:id')||node.getAttributeNS(relNs,'id');
+              if(index<liveDailySheets.length) { node.setAttribute('name',liveDailySheets[index].name); dailyByRelId.set(rid,liveDailySheets[index]); dailySheetNameMap.set(oldName,liveDailySheets[index].name); }
+              else { node.parentNode?.removeChild(node); }
+            });
+            // Remove relationships for excess old daily tabs. Their orphaned XML parts
+            // are harmless in an XLSX zip and need not be copied into the workbook map.
+            const excessDailyRids=new Set(originalDailyNodes.slice(liveDailySheets.length).map(n=>n.getAttribute('r:id')||n.getAttributeNS(relNs,'id')));
+            Array.from(relDoc.getElementsByTagName('Relationship')).forEach(r=>{ if(excessDailyRids.has(r.getAttribute('Id'))) r.parentNode?.removeChild(r); });
+            sheetNodes=Array.from(wbDoc.getElementsByTagName('sheet'));
+          }
+          const colNum = ref => { let n=0; for (const ch of String(ref).match(/^[A-Z]+/i)?.[0]?.toUpperCase() || '') n=n*26+ch.charCodeAt(0)-64; return n; };
+          const toRef = (rowIndex, colIndex) => { let n=colIndex+1, letters=''; while(n){const r=(n-1)%26;letters=String.fromCharCode(65+r)+letters;n=Math.floor((n-1)/26);} return letters+(rowIndex+1); };
+          const writeCell = (doc, cellMap, ref, value) => {
+            let cell=cellMap.get(ref);
+            if (!cell) {
+              const match=ref.match(/^(\$?[A-Z]+)(\$?\d+)$/i); const rowNum=Number(match[2].replace(/\$/g,''));
+              let row=Array.from(doc.getElementsByTagNameNS(ns,'row')).find(r=>Number(r.getAttribute('r'))===rowNum);
+              if(!row){row=doc.createElementNS(ns,'row');row.setAttribute('r',String(rowNum));const data=doc.getElementsByTagNameNS(ns,'sheetData')[0];const rows=Array.from(data.getElementsByTagNameNS(ns,'row'));const after=rows.find(r=>Number(r.getAttribute('r'))>rowNum);data.insertBefore(row,after||null);}
+              cell=doc.createElementNS(ns,'c');cell.setAttribute('r',ref);const cells=Array.from(row.getElementsByTagNameNS(ns,'c'));const idx=colNum(ref);const after=cells.find(c=>colNum(c.getAttribute('r'))>idx);row.insertBefore(cell,after||null);cellMap.set(ref,cell);
+            }
+            while(cell.firstChild)cell.removeChild(cell.firstChild);cell.removeAttribute('t');
+            if(value===null||value===undefined||value==='') return;
+            if(typeof value==='number' && Number.isFinite(value)){const v=doc.createElementNS(ns,'v');v.textContent=String(value);cell.appendChild(v);}
+            else {cell.setAttribute('t','inlineStr');const is=doc.createElementNS(ns,'is');const t=doc.createElementNS(ns,'t');t.setAttribute('xml:space','preserve');t.textContent=String(value);is.appendChild(t);cell.appendChild(is);}
+          };
+          for (const node of sheetNodes) {
+            const name=node.getAttribute('name');
+            const target=relTargets[node.getAttribute('r:id') || node.getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships','id')];
+            if(!target)continue;
+            const path=target.replace(/^\//,'').startsWith('xl/')?target.replace(/^\//,''):'xl/'+target.replace(/^\.\//,'');
+            const file=zip.file(path); if(!file)continue;
+            const model=workbook.sheets.find(sh=>sh.name===name); if(!model)continue;
+            const doc=parser.parseFromString(await file.async('string'),'application/xml');
+            const cellMap=new Map(Array.from(doc.getElementsByTagNameNS(ns,'c')).map(c=>[c.getAttribute('r'),c]));
+            // Remove broken reference formulas/errors from exported report output. These
+            // usually result from the template's original month tabs being renamed or
+            // removed; leaving the formula in place makes Excel display #REF! again.
+            cellMap.forEach(cell=>{
+              const formula=cell.getElementsByTagNameNS(ns,'f')[0];
+              const valueNode=cell.getElementsByTagNameNS(ns,'v')[0];
+              const inlineText=cell.getElementsByTagNameNS(ns,'t')[0];
+              const hasRefError=(formula && /#REF!/i.test(formula.textContent||'')) ||
+                (valueNode && /#REF!/i.test(valueNode.textContent||'')) ||
+                (inlineText && /#REF!/i.test(inlineText.textContent||''));
+              if(hasRefError){ while(cell.firstChild)cell.removeChild(cell.firstChild); cell.removeAttribute('t'); }
+            });
+            const overrides=this.getDsrCsrLiveCellOverrides(name);
+            overrides.forEach((value,ref)=>writeCell(doc,cellMap,ref,typeof value==='string' && /#REF!/i.test(value) ? '' : value));
+            if(this.getDsrCsrDailySheetDateKey(name)) {
+              this.applyDsrCsrDailyInvoiceDetails(name);
+              const rows=model.rows||[];
+              for(let ri=4;ri<Math.min(rows.length,1500);ri++){
+                const row=rows[ri]||[];
+                [0,1,2].forEach(ci=>writeCell(doc,cellMap,toRef(ri,ci),row[ci]));
+              }
+            }
+            zip.file(path,serializer.serializeToString(doc));
+          }
+          zip.file('xl/workbook.xml',serializer.serializeToString(wbDoc));
+          zip.file('xl/_rels/workbook.xml.rels',serializer.serializeToString(relDoc));
+          // Diagnose and clean #REF! across the COMPLETE exported archive, not only
+          // the sheets/models currently rendered in the viewer. In Excel, an error can
+          // persist in a cell's formula, cached <v>, inline string, shared string, or a
+          // hidden worksheet. Clear the whole affected cell payload while retaining its
+          // address and style. Then scrub remaining literal markers in XML/rels parts.
+          const refText = value => /#REF\s*!/i.test(String(value ?? ''));
+          const cleanXmlPart = xmlText => {
+            if (!/#REF\s*!/i.test(xmlText)) return { xml: xmlText, changed: false };
+            const partDoc = parser.parseFromString(xmlText, 'application/xml');
+            if (partDoc.getElementsByTagName('parsererror').length) {
+              // Fallback for unusual XML: strip the marker text at source level.
+              const stripped = xmlText.replace(/#REF\s*!/gi, '');
+              return { xml: stripped, changed: stripped !== xmlText };
+            }
+            let changed = false;
+            const allElements = Array.from(partDoc.getElementsByTagName('*'));
+            for (const cell of allElements.filter(el => el.localName === 'c')) {
+              const formula = Array.from(cell.children || []).find(el => el.localName === 'f');
+              const valueNode = Array.from(cell.children || []).find(el => el.localName === 'v');
+              const inlineNode = Array.from(cell.children || []).find(el => el.localName === 'is');
+              const inlineText = inlineNode ? Array.from(inlineNode.getElementsByTagName('*')).filter(el => el.localName === 't').map(el => el.textContent || '').join('') : '';
+              const broken = refText(formula?.textContent) || refText(valueNode?.textContent) || refText(inlineText) ||
+                ((cell.getAttribute('t') || '').toLowerCase() === 'e' && refText(valueNode?.textContent));
+              if (broken) { while (cell.firstChild) cell.removeChild(cell.firstChild); cell.removeAttribute('t'); changed = true; }
+            }
+            // Shared-string items and other text nodes may be referenced by many cells.
+            for (const el of Array.from(partDoc.getElementsByTagName('*'))) {
+              if (['t','v','f'].includes(el.localName) && refText(el.textContent)) { el.textContent = ''; changed = true; }
+            }
+            return { xml: changed ? serializer.serializeToString(partDoc) : xmlText, changed };
+          };
+          // Clean every live worksheet model too, including hidden/non-selected tabs.
+          for (const sheetModel of (workbook.sheets || [])) {
+            for (const row of (sheetModel.rows || [])) if (Array.isArray(row)) {
+              for (let ci=0; ci<row.length; ci++) {
+                const value=row[ci];
+                if (refText(value)) row[ci]='';
+                else if (value && typeof value==='object') for (const key of ['value','text','formula','display','formattedValue']) if (refText(value[key])) value[key]='';
+              }
+            }
+          }
+          // Process ALL archive entries with textual XML content (worksheet, sharedStrings,
+          // styles, workbook, comments, relationships, and extension metadata).
+          for (const path of Object.keys(zip.files)) {
+            const part=zip.file(path); if (!part || part.dir || !/\.(xml|rels)$/i.test(path)) continue;
+            let source=await part.async('string');
+            // When daily tabs are renamed for the device's active month, update formulas
+            // and defined-name expressions throughout the package too. Renaming only
+            // workbook.xml leaves formulas pointing at deleted month tabs, which Excel
+            // can surface as #REF! despite clean cell values in the source archive.
+            if (typeof dailySheetNameMap !== 'undefined' && dailySheetNameMap.size && /\.(xml|rels)$/i.test(path)) {
+              for (const [oldName,newName] of dailySheetNameMap) {
+                const quoteSheet = name => "'" + String(name).replace(/'/g, "''") + "'";
+                source = source.split(quoteSheet(oldName) + '!').join(quoteSheet(newName) + '!');
+                source = source.split(oldName + '!').join(newName + '!');
+              }
+            }
+            const cleaned=cleanXmlPart(source);
+            if(cleaned.changed || source !== await part.async('string')) zip.file(path,cleaned.xml);
+          }
+          // Final archive-wide assertion: if any XML part still contains the marker,
+          // fail loudly rather than offering a supposedly cleaned export.
+          for (const path of Object.keys(zip.files)) {
+            const part=zip.file(path); if(!part || part.dir || !/\.(xml|rels)$/i.test(path)) continue;
+            if(refText(await part.async('string'))) throw new Error('Export validation found a remaining #REF! marker in '+path+'.');
+          }
+          const zipBlob=await zip.generateAsync({type:'uint8array',compression:'DEFLATE',compressionOptions:{level:6}});
+          // XLSX is a ZIP-based OpenXML package, but its Blob MIME type must be the
+          // Excel workbook type so browsers/download managers don't label it .zip.
+          const out=new Blob([zipBlob],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+          const url=URL.createObjectURL(out);const a=document.createElement('a');a.href=url;
+          const d=new Date();a.download=`DSR_CSR_${d.getFullYear()}_UPDATED.xlsx`;a.type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1500);
+          this.showToast('Exported the full DSR/CSR workbook with live POS values.', 'success');
+        } catch(error) { this.showToast(error?.message || 'Could not export the DSR/CSR workbook.', 'error'); }
       },
 
       exportSalesReportCsv() {
@@ -9269,6 +10124,63 @@
           return;
         }
 
+        // Bind the form before any IndexedDB awaits so a quick tap cannot be lost.
+        if (submit) submit.disabled = true;
+        if (form.dataset.uisAuthBound !== 'true') {
+          form.addEventListener('submit', async event => {
+            event.preventDefault();
+            if (message) message.textContent = '';
+            const userVal = String(username.value || '').trim();
+            const passVal = String(password.value ?? '');
+            if (!userVal || passVal.length < 4) {
+              if (message) message.textContent = 'Enter a username and a PIN/password of at least 4 characters.';
+              return;
+            }
+            if (submit) { submit.disabled = true; submit.textContent = 'Signing in…'; }
+            try {
+              const currentOps = await this.getOperators();
+              if (currentOps.length === 0) {
+                if (passVal !== String(confirmInput?.value ?? '')) {
+                  if (message) message.textContent = 'PIN / Password confirmation does not match.';
+                  return;
+                }
+                const role = 'Manager';
+                if (roleSelect) roleSelect.value = role;
+                await this.saveOperator(userVal, passVal, role);
+                sessionStorage.setItem(this.sessionKey, JSON.stringify({
+                  authenticated: true, username: userVal.toLowerCase(), displayName: userVal, role,
+                  expiresAt: Date.now() + this.sessionHours * 3600000
+                }));
+                await this.startApp();
+                return;
+              }
+
+              const hash = await this.hashSecret(passVal);
+              const normalizedUser = userVal.toLowerCase();
+              const matched = currentOps.find(op => String(op.username || '').trim().toLowerCase() === normalizedUser && op.passwordHash === hash);
+              if (!matched) {
+                if (message) message.textContent = 'Invalid operator username or PIN/password.';
+                password.value = '';
+                password.focus();
+                return;
+              }
+              sessionStorage.setItem(this.sessionKey, JSON.stringify({
+                authenticated: true, username: matched.username,
+                displayName: matched.displayName || matched.username, role: matched.role || 'Operator',
+                expiresAt: Date.now() + this.sessionHours * 3600000
+              }));
+              password.value = '';
+              await this.startApp();
+            } catch (err) {
+              if (message) message.textContent = `Login could not continue: ${err?.message || String(err)} Your saved accounts and data were not deleted.`;
+            } finally {
+              if (submit) { submit.disabled = false; submit.textContent = currentOpsLabel(); }
+            }
+          });
+          form.dataset.uisAuthBound = 'true';
+        }
+        const currentOpsLabel = () => (document.getElementById('uis-auth-confirm-wrap')?.classList.contains('hidden') ? 'Sign In' : 'Create Manager Account & Open POS');
+
         let operators;
         try {
           operators = await this.getOperators();
@@ -9293,6 +10205,7 @@
           return;
         }
         const isFirstSetup = operators.length === 0;
+        if (submit) { submit.disabled = false; submit.textContent = isFirstSetup ? 'Create Manager Account & Open POS' : 'Sign In'; }
 
         if (isFirstSetup) {
           if (title) title.textContent = 'Create Local POS Operator Account';
@@ -9305,61 +10218,7 @@
           if (submit) submit.textContent = 'Create Manager Account & Open POS';
         }
 
-        if (form.dataset.uisAuthBound !== 'true') form.addEventListener('submit', async event => {
-          event.preventDefault();
-          if (message) message.textContent = '';
-          const userVal = String(username.value || '').trim();
-          const passVal = String(password.value ?? '');
-          if (!userVal || passVal.length < 4) {
-            if (message) message.textContent = 'Enter a username and a PIN/password of at least 4 characters.';
-            return;
-          }
-          if (submit) submit.disabled = true;
-          try {
-            const currentOps = await this.getOperators();
-            if (currentOps.length === 0) {
-              if (passVal !== String(confirmInput?.value ?? '')) {
-                if (message) message.textContent = 'PIN / Password confirmation does not match.';
-                return;
-              }
-              const role = 'Manager';
-              if (roleSelect) roleSelect.value = role;
-              await this.saveOperator(userVal, passVal, role);
-              sessionStorage.setItem(this.sessionKey, JSON.stringify({
-                authenticated: true,
-                username: userVal.toLowerCase(),
-                displayName: userVal,
-                role,
-                expiresAt: Date.now() + this.sessionHours * 3600000
-              }));
-              await this.startApp();
-              return;
-            }
 
-            const hash = await this.hashSecret(passVal);
-            const matched = currentOps.find(op => op.username === userVal.toLowerCase() && op.passwordHash === hash);
-            if (!matched) {
-              if (message) message.textContent = 'Invalid operator username or PIN/password.';
-              password.value = '';
-              password.focus();
-              return;
-            }
-            sessionStorage.setItem(this.sessionKey, JSON.stringify({
-              authenticated: true,
-              username: matched.username,
-              displayName: matched.displayName || matched.username,
-              role: matched.role || 'Operator',
-              expiresAt: Date.now() + this.sessionHours * 3600000
-            }));
-            password.value = '';
-            await this.startApp();
-          } catch (err) {
-            if (message) message.textContent = err?.message || 'Authentication error.';
-          } finally {
-            if (submit) submit.disabled = false;
-          }
-        });
-        form.dataset.uisAuthBound = 'true';
 
         if (window.lucide) lucide.createIcons();
         username.focus();

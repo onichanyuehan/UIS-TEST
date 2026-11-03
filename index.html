@@ -234,6 +234,15 @@
     .uis-grid-column-move { display:inline-flex; align-items:center; gap:2px; margin-left:8px; }
     .uis-grid-column-move button { width:20px; height:20px; border:1px solid rgba(148,163,184,.22); border-radius:5px; color:#cbd5e1; background:rgba(15,23,42,.75); line-height:1; font-size:12px; }
 
+    .virtual-grid-row.grid-search-selected > td {
+      background-color: rgba(16,185,129,.22) !important;
+      box-shadow: inset 0 2px 0 rgba(52,211,153,.95), inset 0 -2px 0 rgba(52,211,153,.95);
+    }
+    .virtual-grid-row.grid-search-selected > td:first-child {
+      background-color: rgba(16,185,129,.9) !important; color:#052e24 !important; font-weight:800;
+    }
+    @keyframes gridSearchRowPulse { 0%,100% { filter:brightness(1); } 35% { filter:brightness(1.65); } }
+    .virtual-grid-row.grid-search-selected { animation:gridSearchRowPulse 1.1s ease-in-out 2; scroll-margin:70px; }
     .virtual-grid-row > td {
       height: auto;
       max-height: none;
@@ -2898,6 +2907,8 @@
       activeView: 'scanner',
       isDrawerOpen: false,
       searchQuery: '',
+      gridSearchSelectedRow: null,
+      gridSearchSelectedSheetIdx: null,
       filterModifiedOnly: false,
       _gridSearchTimer: null,
       _gridSearchCache: null,
@@ -7471,6 +7482,8 @@
         this._gridSearchRequestId++;
         this._gridSearchMatchedRows = null;
         this._gridSearchMatchedQuery = '';
+        this.gridSearchSelectedRow = targetRow;
+        this.gridSearchSelectedSheetIdx = targetSheetIdx;
         this.searchQuery = '';
         this.filterModifiedOnly = false;
         this.activeSheetIdx = targetSheetIdx;
@@ -7481,7 +7494,20 @@
         this.toggleSidebarDrawer(false);
         this.renderAll();
         const scroller = document.getElementById('virtual-worksheet-scroll');
-        if (scroller) scroller.scrollTop = this.gridScrollTop;
+        if (scroller) {
+          scroller.scrollTop = this.gridScrollTop;
+          requestAnimationFrame(() => {
+            const selectedRow = scroller.querySelector(`tr[data-grid-row="${targetRow}"]`);
+            if (selectedRow) {
+              selectedRow.classList.add('grid-search-selected');
+              const rowTop = selectedRow.offsetTop;
+              const rowBottom = rowTop + selectedRow.offsetHeight;
+              if (rowTop < scroller.scrollTop + 48 || rowBottom > scroller.scrollTop + scroller.clientHeight) {
+                scroller.scrollTop = Math.max(0, rowTop - Math.max(48, (scroller.clientHeight - selectedRow.offsetHeight) / 2));
+              }
+            }
+          });
+        }
       },
 
       getGridColumnOrder(sheet) {
@@ -7705,7 +7731,7 @@
           const rowCss = rowStyleId !== undefined ? salesExcelCellCss(rowStyleId, this.workbook.styles, activeSheet.showGridLines !== false) : '';
           const rowFrozen = rowNumber <= freezeRows;
           const rowStickyTop = rowFrozen ? `top:${36 + (metrics.prefix[rowIndex] || 0)}px;` : '';
-          return `<tr class="virtual-grid-row" style="height:${rowHeight}px;${rowCss}"><td style="height:${rowHeight}px;min-width:46px;width:46px;box-sizing:border-box;background:#f3f4f6;color:#374151;border:1px solid #d1d5db;text-align:center;vertical-align:middle;position:sticky;${activeSheet.rightToLeft ? 'right' : 'left'}:0;${rowStickyTop}z-index:${rowFrozen ? 8 : 3};" class="font-mono">${rowNumber}</td>${cells}</tr>`;
+          return `<tr data-grid-row="${rowNumber}" class="virtual-grid-row ${this.gridSearchSelectedSheetIdx === this.activeSheetIdx && this.gridSearchSelectedRow === rowNumber ? 'grid-search-selected' : ''}" style="height:${rowHeight}px;${rowCss}"><td style="height:${rowHeight}px;min-width:46px;width:46px;box-sizing:border-box;background:#f3f4f6;color:#374151;border:1px solid #d1d5db;text-align:center;vertical-align:middle;position:sticky;${activeSheet.rightToLeft ? 'right' : 'left'}:0;${rowStickyTop}z-index:${rowFrozen ? 8 : 3};" class="font-mono">${rowNumber}</td>${cells}</tr>`;
         };
 
         let bodyContent = '';

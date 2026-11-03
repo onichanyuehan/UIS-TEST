@@ -7478,6 +7478,16 @@
         if (!sheet || !Number.isFinite(targetRow)) return;
         const rowIndex = sheet.records.findIndex(rec => Number(rec.rowNumber) === targetRow);
         if (rowIndex < 0) return;
+        // Use the worksheet's actual virtual-row metrics. Record-array indexes and
+        // a fixed row-height estimate are not reliable when sheets contain gaps,
+        // hidden rows, custom heights, or filtered rows.
+        const targetRows = this.getGridRowsForView(sheet);
+        const targetListIndex = targetRows.findIndex(row => Number(row.rowNumber) === targetRow);
+        if (targetListIndex < 0) return;
+        const targetMetrics = this.getGridVirtualMetrics(sheet, targetRows);
+        const zoom = Math.max(0.25, Number(this.gridZoom) || 1);
+        const targetTop = (targetMetrics.prefix[targetListIndex] || 0) * zoom;
+        const targetHeight = (targetMetrics.heights[targetListIndex] || targetMetrics.defaultHeight) * zoom;
         clearTimeout(this._gridSearchTimer);
         this._gridSearchRequestId++;
         this._gridSearchMatchedRows = null;
@@ -7488,26 +7498,35 @@
         this.filterModifiedOnly = false;
         this.activeSheetIdx = targetSheetIdx;
         this.activeView = 'workspace';
-        const h = this.gridRowHeight * (this.gridZoom || 1);
-        this.gridScrollTop = Math.max(0, (rowIndex - 4) * h);
-        this.gridStartIndex = Math.max(0, Math.floor(this.gridScrollTop / h) - (this.gridOverscan || 10));
+        this.gridScrollTop = Math.max(0, targetTop - Math.max(48, 0));
+        this.gridStartIndex = Math.max(0, this.getGridStartIndex(targetMetrics, this.gridScrollTop / zoom));
         this.toggleSidebarDrawer(false);
         this.renderAll();
-        const scroller = document.getElementById('virtual-worksheet-scroll');
-        if (scroller) {
-          scroller.scrollTop = this.gridScrollTop;
+        // Wait for the new worksheet DOM and its virtual spacer to be committed
+        // before measuring/scrolling. A second frame handles slower mobile layout.
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          const scroller = document.getElementById('virtual-worksheet-scroll');
+          if (!scroller) return;
+          const desiredTop = Math.max(0, targetTop - Math.max(48, (scroller.clientHeight - targetHeight) * 0.38));
+          scroller.scrollTop = desiredTop;
+          this.gridScrollTop = desiredTop;
           requestAnimationFrame(() => {
             const selectedRow = scroller.querySelector(`tr[data-grid-row="${targetRow}"]`);
-            if (selectedRow) {
-              selectedRow.classList.add('grid-search-selected');
-              const rowTop = selectedRow.offsetTop;
-              const rowBottom = rowTop + selectedRow.offsetHeight;
-              if (rowTop < scroller.scrollTop + 48 || rowBottom > scroller.scrollTop + scroller.clientHeight) {
-                scroller.scrollTop = Math.max(0, rowTop - Math.max(48, (scroller.clientHeight - selectedRow.offsetHeight) / 2));
-              }
+            if (!selectedRow) {
+              // If the virtual window has not caught up yet, force its index from
+              // the exact prefix offset and let the scroll handler render it.
+              this.gridStartIndex = Math.max(0, this.getGridStartIndex(targetMetrics, desiredTop / zoom));
+              this.renderMainView();
+              requestAnimationFrame(() => {
+                const retryRow = document.querySelector(`#virtual-worksheet-scroll tr[data-grid-row="${targetRow}"]`);
+                if (retryRow) retryRow.classList.add('grid-search-selected');
+              });
+              return;
             }
+            selectedRow.classList.add('grid-search-selected');
+            selectedRow.setAttribute('aria-current', 'true');
           });
-        }
+        }));
       },
 
       getGridColumnOrder(sheet) {
